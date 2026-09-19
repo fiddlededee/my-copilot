@@ -1,4 +1,4 @@
-@file:CompilerOptions("-jvm-target", "11")
+@file:CompilerOptions("-jvm-target", "17")
 @file:DependsOn("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 @file:DependsOn("ai.koog:prompt-executor-dashscope-client-jvm:1.1.1-beta")
 @file:DependsOn("ai.koog:prompt-executor-openrouter-client-jvm:1.1.1")
@@ -7,6 +7,7 @@
 @file:DependsOn("ai.koog:prompt-executor-model-jvm:1.1.1")
 @file:DependsOn("ai.koog:prompt-model-jvm:1.1.1")
 @file:DependsOn("ai.koog:http-client-ktor-jvm:1.1.1")
+@file:DependsOn("ai.koog:agents-features-event-handler-jvm:1.1.1")
 @file:DependsOn("org.jsoup:jsoup:1.18.1")
 @file:DependsOn("org.angryscan:core-jvm:1.5.1")
 @file:DependsOn("io.github.cdimascio:dotenv-kotlin:6.4.1")
@@ -17,6 +18,7 @@ import ai.koog.agents.core.agent.AIAgent
 import ai.koog.agents.core.agent.config.AIAgentConfig
 import ai.koog.agents.core.agent.functionalStrategy
 import ai.koog.agents.core.tools.ToolRegistry
+import ai.koog.agents.core.tools.annotations.LLMDescription
 import ai.koog.agents.core.tools.annotations.Tool
 import ai.koog.agents.core.tools.reflect.ToolSet
 import ai.koog.prompt.executor.clients.dashscope.DashscopeLLMClient
@@ -50,6 +52,7 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -60,50 +63,20 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.angryscan.common.engine.kotlin.IKotlinMatcher
 import org.angryscan.common.engine.kotlin.KotlinEngine
-import org.angryscan.common.matchers.Address
-import org.angryscan.common.matchers.BankAccount
-import org.angryscan.common.matchers.BankAccountLE
-import org.angryscan.common.matchers.Birthday
-import org.angryscan.common.matchers.CVV
-import org.angryscan.common.matchers.CadastralNumber
-import org.angryscan.common.matchers.CardNumber
-import org.angryscan.common.matchers.Certificate
-import org.angryscan.common.matchers.CryptoSeedPhrase
-import org.angryscan.common.matchers.CryptoWallet
-import org.angryscan.common.matchers.DriverLicense
-import org.angryscan.common.matchers.EducationDoc
-import org.angryscan.common.matchers.EducationLicense
-import org.angryscan.common.matchers.Email
-import org.angryscan.common.matchers.ExecDocNumber
-import org.angryscan.common.matchers.FullName
-import org.angryscan.common.matchers.Geo
-import org.angryscan.common.matchers.HashData
-import org.angryscan.common.matchers.INN
-import org.angryscan.common.matchers.LegalEntityId
-import org.angryscan.common.matchers.LegalEntityName
-import org.angryscan.common.matchers.Login
-import org.angryscan.common.matchers.MilitaryID
-import org.angryscan.common.matchers.OGRNIP
-import org.angryscan.common.matchers.OKPO
-import org.angryscan.common.matchers.OMS
-import org.angryscan.common.matchers.OSAGOPolicy
-import org.angryscan.common.matchers.Passport
-import org.angryscan.common.matchers.Password
-import org.angryscan.common.matchers.Phone
-import org.angryscan.common.matchers.ResidencePermit
-import org.angryscan.common.matchers.SNILS
-import org.angryscan.common.matchers.SberBook
-import org.angryscan.common.matchers.StateRegContract
-import org.angryscan.common.matchers.VIN
-import org.angryscan.common.matchers.VehicleRegNumber
+import org.angryscan.common.matchers.*
 import java.io.File
 import kotlin.collections.set
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.KParameter
+import ai.koog.agents.core.tools.annotations.InternalAgentToolsApi
+import ai.koog.agents.core.tools.schema.defaultJsonSchemaConfig
+import ai.koog.agents.core.tools.schema.getJsonSchema
+import ai.koog.serialization.typeToken
+import kotlinx.schema.generator.json.JsonSchemaConfig
+import kotlinx.schema.json.JsonSchema
+import ai.koog.agents.features.eventHandler.feature.EventHandler
 
-System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "error")
-System.setProperty("org.slf4j.simpleLogger.log.ai.koog", "error")
 
 data class ProviderTuning(
     val clientClass: KClass<out AbstractOpenAILLMClient<*, *>>,
@@ -148,6 +121,56 @@ class LlmCommon {
 
             else -> error("Unsupported client: ${tuning.clientClass}")
         }
+    }
+
+
+    fun saveCurrentPrompt(promptFilePath: String, iteration: Int, messages: List<Message>) {
+        val nonSystemMessages = messages.filter { it.role != Message.Role.System }
+        if (nonSystemMessages.isEmpty()) return
+
+        val promptDir = File(promptFilePath).parent
+        val promptFileName = File(promptFilePath).nameWithoutExtension
+        val currentPromptFile = File(promptDir, "$promptFileName.current.md")
+
+        fun String.unescape() = arrayOf("""\n""" to "\n", """\t""" to "\t", """\"""" to "\"")
+            .fold(this) { acc, (from, to) -> acc.replace(from, to) }
+
+        val formattedMessages = buildString {
+            nonSystemMessages.forEach { message ->
+                when (message) {
+                    is Message.User -> {
+                        message.parts.forEach { part ->
+                            append("# Us\n\n")
+                            when (part) {
+                                is MessagePart.Tool.Result ->
+                                    append("## ToolResult: ${part.tool}\n\n${part.output.unescape()}\n\n")
+
+                                is MessagePart.Text -> append("${part.text.trim()}\n\n")
+                                else -> {}
+                            }
+                        }
+                    }
+
+                    is Message.Assistant -> {
+                        message.parts.forEach { part ->
+                            append("# As\n\n")
+                            when (part) {
+                                is MessagePart.Tool.Call ->
+                                    append("ToolCall: ${part.tool}\n\n${part.args.unescape()}\n\n")
+
+                                is MessagePart.Text -> append("${part.text.trim()}\n\n")
+                                else -> {}
+                            }
+                        }
+                    }
+
+                    else -> {}
+                }
+            }
+        }
+
+        currentPromptFile.writeText(formattedMessages)
+        info("Saved current prompt to ${currentPromptFile.absolutePath} (iteration $iteration)")
     }
 
     fun parsePromptWithMarkers(prompt: String): List<Pair<Message.Role, String>> {
@@ -196,6 +219,58 @@ class LlmCommon {
         val updatedContent = content + "\n\n# As\n\n$processedResponse\n\n# Us"
 
         file.writeText(updatedContent)
+    }
+
+    @OptIn(InternalAgentToolsApi::class)
+    inline fun <reified T> generateSchema(
+        config: JsonSchemaConfig = defaultJsonSchemaConfig
+    ): String {
+        val schema = getJsonSchema(
+            typeToken = typeToken<T>(),
+            jsonSchemaConfig = config
+        )
+        return Json { prettyPrint = true }
+            .encodeToString(JsonSchema.serializer(), schema)
+    }
+
+    inline fun <reified T> correctJson(jsonString: String): T? {
+        val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
+
+        try {
+            return json.decodeFromString<T>(jsonString)
+        } catch (_: Exception) {
+            info("correctJson: direct deserialization failed")
+        }
+
+        val cleaned = jsonString.trim()
+            .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        try {
+            return json.decodeFromString<T>(cleaned)
+        } catch (e: Exception) {
+            info("correctJson: after markdown cleanup failed: ${e.message}")
+        }
+
+        info("correctJson: falling back to LLM correction")
+        return runBlocking {
+            val agent = AIAgent(
+                promptExecutor = executor(providerTuning()),
+                strategy = functionalStrategy<String, T?> { input ->
+                    requestLLMStructured<T>(
+                        "The following message contains JSON that couldn't be deserialized." +
+                                "\n\nCorrect it to match the required schema." +
+                                "\n\n# The JSON is:\n\n$input"
+                    ).getOrNull()?.data
+                },
+                agentConfig = AIAgentConfig(
+                    prompt = Prompt.build(id = "json-correction") {
+                        system("You are a helpful agent. Your task is to fix JSON errors.")
+                    },
+                    model = currentModel(),
+                    maxAgentIterations = 3
+                )
+            )
+            agent.run(jsonString)
+        }
     }
 
     inner class RequestModifierPlugin(val requestModifier: (MutableMap<String, JsonElement>) -> Unit) :
@@ -262,20 +337,11 @@ class Monitoring {
         private var reasoningContent: String = "",
         private var textContent: String = "",
         private var savedLength: Int = 0,
-        private var toolCallsLog: String = ""
+        private var toolCallsInitiated: Boolean = false
     ) {
-        fun appendReasoning(text: String) {
-            if (text.isNotEmpty()) reasoningContent += text
-        }
-
-        fun appendText(text: String) {
-            if (text.isNotEmpty()) textContent += text
-        }
-
-        fun appendToolCall(name: String?, argsChunk: String?) {
-            name?.apply { toolCallsLog += "\n\nName: $name\nArgs: $toolCallsLog" }
-            argsChunk?.apply { toolCallsLog += argsChunk }
-        }
+        fun appendReasoning(text: String) = apply { if (text.isNotEmpty()) reasoningContent += text }
+        fun appendText(text: String) = apply { if (text.isNotEmpty()) textContent += text }
+        fun markToolCallInititaion() = apply { toolCallsInitiated = true }
 
         fun shouldSerialize(threshold: Int = 200): Boolean {
             val currentTotal = reasoningContent.length + textContent.length
@@ -285,9 +351,8 @@ class Monitoring {
         fun toMarkdown(): String = arrayOf(
             reasoningContent.takeIf { it.isNotEmpty() }?.let { "# Reasoning Content\n\n${it.trim()}" },
             textContent.takeIf { it.isNotEmpty() }?.let { "# Text Content\n\n${it.trim()}" },
-            toolCallsLog.takeIf { it.isNotEmpty() }?.let { "# Tool Calling Log\n\n${it.trim()}" },
-
-            ).filterNotNull().joinToString("\n\n")
+            toolCallsInitiated.takeIf { it }?.let { "# Tool Calling Log\n\nTools were called" }
+        ).filterNotNull().joinToString("\n\n")
 
         fun resetCounter() {
             savedLength = reasoningContent.length + textContent.length
@@ -298,9 +363,16 @@ class Monitoring {
         progressMap.forEach { (id, progress) ->
             progress.toMarkdown()
                 .takeIf { it.isNotBlank() }
-                ?.let { File(outputDir, "$id.md").writeText(it) }
+                ?.let { saveToFile(id, it) }
         }
         progressMap.clear()
+    }
+
+    private fun saveToFile(id: String, content: String) {
+        val file = File(outputDir, "$id.md")
+        val isFirstWrite = !file.exists()
+        file.writeText(content)
+        if (isFirstWrite) info("Session log: file://${file.absolutePath}")
     }
 
     fun processEvent(eventData: String?) {
@@ -316,20 +388,14 @@ class Monitoring {
         val id = root["id"]?.jsonPrimitive?.content ?: return
         val reasoning = delta["reasoning_content"]?.jsonPrimitive?.contentOrNull
         val content = delta["content"]?.jsonPrimitive?.contentOrNull
-        val (tcArgs, tcName) = arrayOf("arguments", "name").map { key ->
-            delta["tool_calls"]?.jsonArray?.firstOrNull()
-                ?.jsonObject?.get("function")?.jsonObject?.get(key)?.jsonPrimitive?.contentOrNull
-        }
-
-        if (arrayOf(reasoning, content, tcArgs, tcName).filterNotNull().isEmpty()) return
+        val hasTcDelta = delta["tool_calls"]?.jsonArray?.isNotEmpty() ?: false
 
         val progress = progressMap.getOrPut(id) { ResponseProgress() }
         reasoning?.let(progress::appendReasoning)
         content?.let(progress::appendText)
-        if (tcArgs != null || tcName != null) progress.appendToolCall(tcName, tcArgs)
-
+        if (hasTcDelta) apply { progress.markToolCallInititaion() }
         if (progress.shouldSerialize()) {
-            File(outputDir, "$id.md").writeText(progress.toMarkdown())
+            saveToFile(id, progress.toMarkdown())
             progress.resetCounter()
         }
     }
@@ -345,7 +411,9 @@ fun info(message: String) {
     }
 }
 
-object Redaction {
+val redaction = Redaction()
+
+class Redaction {
     val redactionMatchers = listOf<IKotlinMatcher>(
         Passport, SNILS, INN, OMS, OGRNIP, OKPO, Phone, Email, Address, FullName,
         CardNumber(), BankAccount, BankAccountLE, DriverLicense, VehicleRegNumber, VIN,
@@ -420,6 +488,63 @@ class Prompts {
             - ${"maxEntries" from this} -- max total entries across all levels; tree stops expanding when next level would exceed this
               recommended value to start with is 50""".trimIndent()
         }
+
+        MainAgentTools::modifyFile.defineDescription {
+            val schema = llmCommon.generateSchema<MainAgentTools.ModificationList>()
+            """
+            Modifies a file by applying a list of modifications.
+            The modifications are provided as a JSON string that must conform to the schema below.
+
+            ### PARAMETERS
+
+            - ${"filePath" from this} -- absolute path to the file to create/modify
+
+            - ${"modificationsJson" from this} -- JSON string containing the list of modifications.
+              Must conform to the following JSON schema:
+
+              ```
+              $schema
+              ```
+
+            IMPORTANT:
+            - Line numbers are 1-based
+            - Modifications must NOT overlap (disjoint ranges/points)
+            - Sort modifications by startLine in descending order (highest line numbers first)
+            - Line numbers should refer to the ORIGINAL file state
+            - Try to use this tool after you understand all needed changes to avoid running
+              this tool twice against the same file
+            """.trimIndent()
+        }
+
+        MainAgentTools::askForClarification.defineDescription {
+            """
+            Breaks the process and outputs a clarifying question to the user.
+            Use this tool INSTEAD of guessing or generating multiple solution options
+            when the task is ambiguous or requires user input.
+            If the question implies a choice, format options as a numbered list in the text.
+
+            ### Params
+
+            - ${"question" from this} -- the clarifying question to ask the user
+            """.trimIndent()
+        }
+
+        MainAgentTools::searchInternet.defineDescription {
+            """
+            Searches the public internet and returns a synthesized answer with source URLs.
+            The query is delegated to a separate web-research agent that has live internet access.
+            Use it whenever the answer is not in the local filesystem: library versions and
+            changelogs, API signatures that changed after your knowledge cutoff, error messages,
+            current documentation, release notes, anything time-sensitive.
+
+            ### Params
+
+            - ${"query" from this} -- a self-contained search query or a precise question.
+              It is handed to the research agent verbatim, without any conversation history,
+              so put all the needed context into it yourself (exact library names, versions,
+              OS, the error text). Prefer one precise query over several vague ones.
+            """.trimIndent()
+        }
     }
 }
 
@@ -436,13 +561,12 @@ class MainAgentTools : ToolSet {
             info("readFile: proposal found")
             proposalFile
         } else File(path)
-        info("readFile is run: ${file.absolutePath} (maxSizeText: $maxSizeText)")
         if (!file.exists()) return "ERROR: File doesn't exist"
         if (file.isDirectory) return "ERROR: It is a path, not a file"
         val fullText = file.readText()
         val truncated = fullText.length > maxSizeText
         val rawText = fullText.take(maxSizeText)
-        val redactedText = Redaction.redactText(rawText)
+        val redactedText = redaction.redactText(rawText)
         val lines = redactedText.lines() // разбиваем на строки
         val numberedContent = lines.mapIndexed { index, line ->
             "${index + 1}: $line"
@@ -457,7 +581,6 @@ class MainAgentTools : ToolSet {
 
     @Tool
     fun readDirectory(path: String, maxEntries: Int): String {
-        info("readDirectory is run: $path (maxEntries: $maxEntries)")
         val dir = File(path)
         if (!dir.exists()) return "ERROR: Directory doesn't exist"
         if (!dir.isDirectory) return "ERROR: It is a file, not a directory"
@@ -473,7 +596,7 @@ class MainAgentTools : ToolSet {
             val nextLevelDirs = mutableListOf<File>()
 
             for (d in currentLevelDirs) {
-                val entries = d.listFiles() ?: continue
+                val entries = d.listFiles()?.filter(::takeFileIf) ?: continue
                 levelCount += entries.size
                 for (entry in entries) {
                     if (entry.isDirectory) nextLevelDirs += entry
@@ -496,7 +619,7 @@ class MainAgentTools : ToolSet {
 
         fun render(file: File, prefix: String, depth: Int) {
             if (depth >= maxDepth) return
-            val entries = file.listFiles()
+            val entries = file.listFiles()?.filter(::takeFileIf)
                 ?.sortedWith(compareBy({ !it.isDirectory }, { it.name }))
                 ?: return
 
@@ -527,6 +650,245 @@ class MainAgentTools : ToolSet {
         bytes < 1024L * 1024 * 1024 -> "${bytes / (1024 * 1024)} MB"
         else -> "${bytes / (1024L * 1024 * 1024)} GB"
     }
+
+
+    @Serializable
+    enum class ModificationType { APPEND, DELETE, REPLACE, REPLACE_IN_LINE }
+
+    @Serializable
+    @LLMDescription(
+        """
+        A single modification instruction for a file.
+        Exactly one of four operation types must be specified via the 'type' field.
+        Fields that are not relevant for the chosen type must be null.
+
+        - APPEND: Insert new content after a specific line.
+          Required: startLine (the line AFTER which to insert), contents (text to insert).
+          endLine, searchText, replacementText must be null.
+
+        - DELETE: Remove a contiguous range of lines.
+          Required: startLine (first line to delete), endLine (last line to delete, inclusive).
+          contents, searchText, replacementText must be null.
+
+        - REPLACE: Replace a contiguous range of lines with new content.
+          Required: startLine (first line to replace), endLine (last line to replace, inclusive),
+                    contents (replacement text).
+          searchText, replacementText must be null.
+
+        - REPLACE_IN_LINE: Find-and-replace a substring within a single line.
+          Required: startLine (the line number), searchText (substring to find),
+                    replacementText (substring to replace with).
+          endLine, contents must be null.
+        """
+    )
+    data class Modification(
+        @property:LLMDescription("The type of modification to perform.")
+        val type: ModificationType,
+
+        @property:LLMDescription("Line number (1-based) where the operation starts or applies.")
+        val startLine: Int?,
+
+        @property:LLMDescription("Line number (1-based, inclusive) where the operation ends. Used only for DELETE and REPLACE.")
+        val endLine: Int?,
+
+        @property:LLMDescription("Text content to insert or use as replacement. Used for APPEND and REPLACE.")
+        val contents: String?,
+
+        @property:LLMDescription("Substring to search for within a single line. Used only for REPLACE_IN_LINE.")
+        val searchText: String?,
+
+        @property:LLMDescription("Replacement substring for find-and-replace. Used only for REPLACE_IN_LINE.")
+        val replacementText: String?
+    )
+
+    @Serializable
+    @LLMDescription("A wrapper for a list of file modifications")
+    data class ModificationList(
+        @property:LLMDescription("List of modifications sorted by startLine descending (highest line numbers first)")
+        val modifications: List<Modification>
+    )
+
+    private val proposalSubAgent = ProposalSubAgent()
+
+    @Tool
+    fun modifyFile(filePath: String, modificationsJson: String): String {
+        val canonicalPath = File(filePath).absolutePath
+        val proposalFile = File("$filePath.proposal")
+        if (proposalFile.exists() && canonicalPath !in readFiles) {
+            return "ERROR: File '$filePath' has been modified. " +
+                    "You must read the current state first " +
+                    "before making further modifications."
+        }
+        readFiles.remove(canonicalPath)
+        return proposalSubAgent.createProposal(filePath, modificationsJson)
+    }
+
+    @Tool
+    fun askForClarification(question: String): String {
+        return "CLARIFICATION_REQUESTED: $question"
+    }
+
+    private val searchSubAgent = SearchSubAgent()
+
+    @Tool
+    fun searchInternet(query: String): String {
+        return try {
+            searchSubAgent.search(query).trim()
+                .ifEmpty { "ERROR: search agent returned an empty answer" }
+        } catch (e: Exception) {
+            "ERROR: internet search failed: ${e.message}"
+        }
+    }
+}
+
+class ProposalSubAgent {
+
+    fun validateModifications(modifications: List<MainAgentTools.Modification>): String? {
+        for ((index, mod) in modifications.withIndex()) {
+            val label = "Modification #${index + 1} (${mod.type})"
+            when (mod.type) {
+                MainAgentTools.ModificationType.APPEND -> {
+                    if (mod.startLine == null) return "$label: startLine is required"
+                    if (mod.contents == null) return "$label: contents is required"
+                    if (mod.endLine != null) return "$label: endLine must be null"
+                    if (mod.searchText != null) return "$label: searchText must be null"
+                    if (mod.replacementText != null) return "$label: replacementText must be null"
+                }
+
+                MainAgentTools.ModificationType.DELETE -> {
+                    if (mod.startLine == null) return "$label: startLine is required"
+                    if (mod.endLine == null) return "$label: endLine is required"
+                    if (mod.contents != null) return "$label: contents must be null"
+                    if (mod.searchText != null) return "$label: searchText must be null"
+                    if (mod.replacementText != null) return "$label: replacementText must be null"
+                }
+
+                MainAgentTools.ModificationType.REPLACE -> {
+                    if (mod.startLine == null) return "$label: startLine is required"
+                    if (mod.endLine == null) return "$label: endLine is required"
+                    if (mod.contents == null) return "$label: contents is required"
+                    if (mod.searchText != null) return "$label: searchText must be null"
+                    if (mod.replacementText != null) return "$label: replacementText must be null"
+                }
+
+                MainAgentTools.ModificationType.REPLACE_IN_LINE -> {
+                    if (mod.startLine == null) return "$label: startLine is required"
+                    if (mod.searchText == null) return "$label: searchText is required"
+                    if (mod.replacementText == null) return "$label: replacementText is required"
+                    if (mod.endLine != null) return "$label: endLine must be null"
+                    if (mod.contents != null) return "$label: contents must be null"
+                }
+            }
+        }
+        return null
+    }
+
+    fun applyModifications(file: File, modifications: List<MainAgentTools.Modification>) {
+        if (modifications.isEmpty()) return
+        val lines = file.readLines().toMutableList()
+        val sorted = modifications.sortedByDescending { it.startLine ?: 0 }
+
+        for (mod in sorted) {
+            when (mod.type) {
+                MainAgentTools.ModificationType.APPEND -> {
+                    val insertIndex = mod.startLine ?: continue
+                    val safeIndex = insertIndex.coerceIn(0, lines.size)
+                    val linesToInsert = mod.contents?.lines() ?: emptyList()
+                    if (linesToInsert.isNotEmpty()) lines.addAll(safeIndex, linesToInsert)
+                }
+
+                MainAgentTools.ModificationType.DELETE -> {
+                    val startLine = mod.startLine ?: continue
+                    val endLine = mod.endLine ?: startLine
+                    val si = startLine - 1;
+                    val ei = endLine - 1
+                    if (si >= 0 && ei < lines.size && si <= ei)
+                        lines.subList(si, ei + 1).clear()
+                }
+
+                MainAgentTools.ModificationType.REPLACE -> {
+                    val startLine = mod.startLine ?: continue
+                    val endLine = mod.endLine ?: startLine
+                    val si = startLine - 1;
+                    val ei = endLine - 1
+                    val newLines = mod.contents?.lines() ?: emptyList()
+                    if (si >= 0 && ei < lines.size && si <= ei) {
+                        lines.subList(si, ei + 1).clear()
+                        lines.addAll(si, newLines)
+                    }
+                }
+
+                MainAgentTools.ModificationType.REPLACE_IN_LINE -> {
+                    val lineIndex = (mod.startLine ?: continue) - 1
+                    if (lineIndex >= 0 && lineIndex < lines.size
+                        && mod.searchText != null && mod.replacementText != null
+                    ) {
+                        lines[lineIndex] = lines[lineIndex].replace(mod.searchText, mod.replacementText)
+                    }
+                }
+            }
+        }
+        file.writeText(lines.joinToString("\n"))
+    }
+
+    fun createProposal(originalFilePath: String, modificationsJson: String): String {
+        val originalFile = File(originalFilePath)
+        val proposalFile = File(
+            originalFile.parentFile,
+            "${originalFile.name}.proposal"
+        )
+
+        if (!proposalFile.exists()) {
+            if (originalFile.exists()) originalFile.copyTo(proposalFile, overwrite = true)
+            else proposalFile.writeText("")
+        }
+
+        val modificationList = llmCommon.correctJson<MainAgentTools.ModificationList>(modificationsJson)
+            ?: return "ERROR: Couldn't parse modifications JSON even after LLM correction"
+
+        val validationError = validateModifications(modificationList.modifications)
+        if (validationError != null) return "ERROR: $validationError"
+
+        applyModifications(proposalFile, modificationList.modifications)
+        return "File ${originalFile.absolutePath} was successfully modified"
+    }
+}
+
+class SearchSubAgent {
+    private val systemPrompt =
+        """
+        You are a web research agent with live internet access.
+        For EVERY request you must search the web and answer only from what you find,
+        never from prior knowledge.
+
+        Rules:
+        - Answer directly and concretely: versions, dates, names, parameter lists,
+          short code snippets.
+        - State explicitly when your sources disagree or when a fact is unverified.
+        - Do not repeat the question back, do not pad the answer.
+        - End with a 'Sources:' section, one URL per line, for everything you used.
+        - If the search results do not answer the question, reply exactly: NOT FOUND
+        """.trimIndent()
+
+    fun search(query: String): String {
+        val answer = runBlocking {
+            AIAgent(
+                promptExecutor = llmCommon.executor(searchProviderTuning()),
+                strategy = functionalStrategy<String, String> { input ->
+                    requestLLMStreaming(input).toList().toMessageResponse().parts
+                        .filterIsInstance<MessagePart.Text>()
+                        .joinToString("\n\n") { it.text }
+                },
+                agentConfig = AIAgentConfig(
+                    prompt = Prompt.build(id = "web-search") { system(systemPrompt) },
+                    model = searchModel(),
+                    maxAgentIterations = 1
+                )
+            ).run(query)
+        }
+        info("searchInternet answer: ${answer.length} chars")
+        return answer
+    }
 }
 
 fun mainAgent() = AIAgent(
@@ -545,34 +907,76 @@ fun mainAgent() = AIAgent(
             }
         }
 
-        suspend fun callAndLog(iteration: Int): Pair<Message.Assistant, List<MessagePart.Tool.Call>> {
+        data class CallResult(
+            val response: Message.Assistant,
+            val toolCalls: List<MessagePart.Tool.Call>,
+            val shouldGoOn: Boolean
+        )
+
+        fun checkRules(toolCalls: List<MessagePart.Tool.Call>): List<String> {
+            val violations = mutableListOf<String>()
+            return violations
+        }
+
+        suspend fun callAndLog(iteration: Int): CallResult {
             val response1 = llm().writeSession { requestLLMStreaming() }
             val response2 = response1.toList()
             val response = response2.toMessageResponse()
+            llm().writeSession { appendPrompt { message(response) } }
+
             info(
                 "Iteration: $iteration, Input: ${response.metaInfo.inputTokensCount}, " +
                         "Output: ${response.metaInfo.outputTokensCount}"
             )
             val toolCalls = response.parts.filterIsInstance<MessagePart.Tool.Call>()
-            return response to toolCalls
+
+            // Check rules
+            val violations = checkRules(toolCalls)
+            if (violations.isNotEmpty()) {
+                llm().writeSession {
+                    appendPrompt { user("RULE VIOLATION: ${violations.joinToString("; ")}") }
+                }
+                return CallResult(response, emptyList(), true)
+            }
+
+            return CallResult(response, toolCalls, toolCalls.isNotEmpty())
         }
 
         var iteration = 1
-        var (response, toolCalls) = callAndLog(iteration)  // сохраняем первый ответ
-        while (toolCalls.isNotEmpty() && iteration < 30) {
-            executeTools(toolCalls).let { results ->
-                appendPrompt {
-                    user { results.forEach { toolResult(it.toMessagePart()) } }
+        var lastResponse: Message.Assistant? = null
+
+        while (iteration < 30) {
+            val result = callAndLog(iteration)
+            lastResponse = result.response
+
+            if (result.toolCalls.isNotEmpty()) {
+                executeTools(result.toolCalls).let { results ->
+                    val clarificationQuestion = results.firstNotNullOfOrNull { result ->
+                        result.toMessagePart()
+                            .output.removeSurrounding("\"")
+                            .takeIf { it.startsWith("CLARIFICATION_REQUESTED:") }
+                            ?.removePrefix("CLARIFICATION_REQUESTED:")?.trim()
+                    }
+                    if (clarificationQuestion != null) return@functionalStrategy clarificationQuestion
+                    appendPrompt {
+                        user { results.forEach { toolResult(it.toMessagePart()) } }
+                    }
                 }
+                llmCommon.saveCurrentPrompt(
+                    promptFilePath(),
+                    iteration,
+                    llm().readSession { prompt.messages }
+                )
             }
-            val (newResponse, newToolCalls) = callAndLog(++iteration)
-            response = newResponse
-            toolCalls = newToolCalls
+
+            if (!result.shouldGoOn) break
+
+            iteration++
         }
 
-        val finalText = response.parts
-            .filterIsInstance<MessagePart.Text>()
-            .joinToString("\n\n") { it.text }
+        val finalText = lastResponse?.parts
+            ?.filterIsInstance<MessagePart.Text>()
+            ?.joinToString("\n\n") { it.text } ?: ""
         finalText
     },
     agentConfig = AIAgentConfig(
@@ -595,34 +999,68 @@ fun mainAgent() = AIAgent(
             MainAgentTools().asTools()
                 .filter { tool -> currentTools().any { currentTool -> currentTool.name == tool.name } })
     },
+    installFeatures = {
+        install(EventHandler) {
+            onToolCallStarting { eventContext ->
+                val args = eventContext.toolArgs.entries.toList()
+                    .joinToString("\n") { "${it.first}\n${it.second}" }
+                info("Tool: ${eventContext.toolName}\n$args")
+            }
+            onToolCallCompleted { eventContext ->
+                // Here saving fact of tool calling
+            }
+        }
+    }
 )
 
-val promptFileObj = File(promptFilePath())
-if (!promptFileObj.exists()) {
-    info("Prompt file not found: ${promptFileObj.absolutePath}")
-    if (args.isEmpty()) {
-        info("No command line argument provided, and 'prompt.md' doesn't exist in the current directory.")
+if (mainCycle()) run {
+    System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "error")
+    System.setProperty("org.slf4j.simpleLogger.log.ai.koog", "error")
+    val promptFileObj = File(promptFilePath())
+    if (!promptFileObj.exists()) {
+        info("Prompt file not found: ${promptFileObj.absolutePath}")
+        if (args.isEmpty()) {
+            info("No command line argument provided, and 'prompt.md' doesn't exist in the current directory.")
+        }
+        kotlin.system.exitProcess(1)
     }
-    kotlin.system.exitProcess(1)
+    info("start v1")
+    val response =
+        runBlocking { mainAgent().run(promptFileObj.readText()) }
+    llmCommon.apply { outputAnswer(response, promptFileObj) }
+    info("finish")
 }
-info("start v1")
-val response =
-    runBlocking { mainAgent().run(promptFileObj.readText()) }
-llmCommon.apply { outputAnswer(response, promptFileObj) }
-info("finish")
 
 // ========== Tuning agent =============
 
 fun promptFilePath() = args[0]
 fun providerTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
     it["enable_thinking"] = JsonPrimitive(true)
-//    it["enable_search"] = JsonPrimitive(true)
-//    it["search_options"] = JsonObject(mapOf("search_strategy" to JsonPrimitive("agent")))
 }
+
+fun searchProviderTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
+    it["enable_thinking"] = JsonPrimitive(true)
+    it["enable_search"] = JsonPrimitive(true)
+    it["search_options"] = JsonObject(
+        mapOf(
+            "search_strategy" to JsonPrimitive("agent"),
+            "forced_search" to JsonPrimitive(true)
+        )
+    )
+}
+fun searchModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
+
 fun currentModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
 fun maxSizeText() = 40000
 fun currentTools() = setOf<KFunction<String>>(
     MainAgentTools::readFile,
-    MainAgentTools::readDirectory
+//    MainAgentTools::readDirectory,
+    MainAgentTools::modifyFile,
+    MainAgentTools::askForClarification,
+    MainAgentTools::searchInternet
 )
 
+fun mainCycle() = true
+
+fun takeFileIf(file: File): Boolean =
+    !file.name.startsWith(".") && file.extension != "proposal"
