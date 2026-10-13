@@ -1,13 +1,13 @@
 @file:CompilerOptions("-jvm-target", "17")
 @file:DependsOn("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
-@file:DependsOn("ai.koog:prompt-executor-dashscope-client-jvm:1.1.1-beta")
-@file:DependsOn("ai.koog:prompt-executor-openrouter-client-jvm:1.1.1")
-@file:DependsOn("ai.koog:prompt-executor-openai-client-jvm:1.1.1")
-@file:DependsOn("ai.koog:agents-core-jvm:1.1.1")
-@file:DependsOn("ai.koog:prompt-executor-model-jvm:1.1.1")
-@file:DependsOn("ai.koog:prompt-model-jvm:1.1.1")
-@file:DependsOn("ai.koog:http-client-ktor-jvm:1.1.1")
-@file:DependsOn("ai.koog:agents-features-event-handler-jvm:1.1.1")
+@file:DependsOn("ai.koog:prompt-executor-dashscope-client-jvm:1.3.0-beta")
+@file:DependsOn("ai.koog:prompt-executor-openrouter-client-jvm:1.3.0")
+@file:DependsOn("ai.koog:prompt-executor-openai-client-jvm:1.3.0")
+@file:DependsOn("ai.koog:agents-core-jvm:1.3.0")
+@file:DependsOn("ai.koog:prompt-executor-model-jvm:1.3.0")
+@file:DependsOn("ai.koog:prompt-model-jvm:1.3.0")
+@file:DependsOn("ai.koog:http-client-ktor-jvm:1.3.0")
+@file:DependsOn("ai.koog:agents-features-event-handler-jvm:1.3.0")
 @file:DependsOn("org.jsoup:jsoup:1.18.1")
 @file:DependsOn("org.angryscan:core-jvm:1.5.1")
 @file:DependsOn("io.github.cdimascio:dotenv-kotlin:6.4.1")
@@ -16,6 +16,7 @@
 
 import ai.koog.agents.core.agent.AIAgent
 import ai.koog.agents.core.agent.config.AIAgentConfig
+import ai.koog.agents.core.agent.context.AIAgentLLMContext
 import ai.koog.agents.core.agent.functionalStrategy
 import ai.koog.agents.core.tools.ToolRegistry
 import ai.koog.agents.core.tools.annotations.LLMDescription
@@ -43,6 +44,7 @@ import io.ktor.client.plugins.sse.SSESession
 import io.ktor.client.request.HttpRequestPipeline
 import io.ktor.client.statement.HttpResponseContainer
 import io.ktor.client.statement.HttpResponsePipeline
+
 import io.ktor.sse.ServerSentEvent
 import io.ktor.util.AttributeKey
 import io.ktor.utils.io.InternalAPI
@@ -76,7 +78,10 @@ import ai.koog.serialization.typeToken
 import kotlinx.schema.generator.json.JsonSchemaConfig
 import kotlinx.schema.json.JsonSchema
 import ai.koog.agents.features.eventHandler.feature.EventHandler
-
+import ai.koog.prompt.llm.LLMCapability
+import kotlinx.io.files.Path as KPath
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 data class ProviderTuning(
     val clientClass: KClass<out AbstractOpenAILLMClient<*, *>>,
@@ -85,7 +90,6 @@ data class ProviderTuning(
 )
 
 val llmCommon = LlmCommon()
-
 class LlmCommon {
     fun executor(providerTuning: ProviderTuning): PromptExecutor {
         return PromptExecutor.builder().addClient(createClient(providerTuning)).build()
@@ -150,7 +154,6 @@ class LlmCommon {
                             }
                         }
                     }
-
                     is Message.Assistant -> {
                         message.parts.forEach { part ->
                             append("# As\n\n")
@@ -163,7 +166,6 @@ class LlmCommon {
                             }
                         }
                     }
-
                     else -> {}
                 }
             }
@@ -323,6 +325,33 @@ class LlmCommon {
     }
 
 
+    fun getToolCallParam(toolCall: MessagePart.Tool.Call, paramName: String): String? {
+        val json = Json { ignoreUnknownKeys = true }
+        val argsJson = json.parseToJsonElement(toolCall.args).jsonObject
+        val paramElement = argsJson[paramName] ?: return null
+        return when (paramElement) {
+            is JsonPrimitive -> paramElement.content
+            else -> paramElement.toString()
+        }
+    }
+
+    suspend fun getToolCallArgs(
+        context: AIAgentLLMContext,
+        toolName: String,
+        paramName: String
+    ): List<Pair<Int, String>> =
+        context.readSession { prompt.messages }
+            .withIndex()
+            .filter { it.value is Message.Assistant }
+            .flatMap { (index, message) ->
+                (message as Message.Assistant).parts
+                    .filterIsInstance<MessagePart.Tool.Call>()
+                    .filter { it.tool == toolName }
+                    .mapNotNull { toolCall ->
+                        getToolCallParam(toolCall, paramName)?.let { index to it }
+                    }
+            }
+
 }
 
 val monitoring = Monitoring()
@@ -415,11 +444,8 @@ val redaction = Redaction()
 
 class Redaction {
     val redactionMatchers = listOf<IKotlinMatcher>(
-        Passport, SNILS, INN, OMS, OGRNIP, OKPO, Phone, Email, Address, FullName,
-        CardNumber(), BankAccount, BankAccountLE, DriverLicense, VehicleRegNumber, VIN,
-        CadastralNumber, OSAGOPolicy, SberBook, ResidencePermit, MilitaryID,
-        LegalEntityId, LegalEntityName, Birthday, Certificate, EducationDoc, EducationLicense,
-        ExecDocNumber, StateRegContract, Login, Geo, Password,
+        Passport, SNILS, INN, OMS, Address, FullName, CardNumber(),
+        DriverLicense, ResidencePermit, MilitaryID, Password,
         CryptoWallet, CryptoSeedPhrase, CVV, HashData
     )
     val redactionEngine = KotlinEngine(redactionMatchers)
@@ -452,7 +478,7 @@ val prompts = Prompts()
 class Prompts {
     private val toolPromptRegistry = mutableMapOf<KFunction<*>, String>()
     fun KFunction<*>.defineDescription(block: KFunction<*>.() -> String) {
-        toolPromptRegistry[this] = "## ${this.name}\n\n${block()}"
+        toolPromptRegistry[this] = "\n## ${this.name}\n\n${block()}"
     }
 
     fun KFunction<*>.description(): String? = toolPromptRegistry[this]
@@ -473,8 +499,8 @@ class Prompts {
             ### Params
 
             - ${"path" from this} -- absolute path to the file
-            - ${"maxSizeText" from this} -- tool returns first maxSizeText characters
-              recommended value to start with is ${maxSizeText()}""".trimIndent()
+            - ${"readLimit" from this} -- tool returns first maxSizeText characters
+              recommended value to start with is ${startReadLimit()}""".trimIndent()
         }
 
         MainAgentTools::readDirectory.defineDescription {
@@ -495,7 +521,7 @@ class Prompts {
             Modifies a file by applying a list of modifications.
             The modifications are provided as a JSON string that must conform to the schema below.
 
-            ### PARAMETERS
+            ### Params
 
             - ${"filePath" from this} -- absolute path to the file to create/modify
 
@@ -503,7 +529,7 @@ class Prompts {
               Must conform to the following JSON schema:
 
               ```
-              $schema
+              ${schema.prependIndent("              ")}
               ```
 
             IMPORTANT:
@@ -545,17 +571,86 @@ class Prompts {
               OS, the error text). Prefer one precise query over several vague ones.
             """.trimIndent()
         }
+
+        MainAgentTools::analyzeImage.defineDescription {
+            """
+            Analyzes an image file and answers a specific question about its contents.
+            Supports only: .jpg, .jpeg, .png, .svg (images).
+            Returns an error for unsupported types or files larger than 15MB.
+
+            ### Params
+            - ${"filePath" from this} -- absolute path to the image file
+            - ${"question" from this} -- specific question to answer based on image contents
+
+            ### Returns
+            Detailed analysis result or error message.
+            """.trimIndent()
+        }
+
+        MainAgentTools::runScript.defineDescription {
+            val dockerfileContent = File("Dockerfile").takeIf { it.exists() }?.readText()
+            val volumesInfo = dockerVolumes().entries.joinToString("\n") { 
+                "  - ${it.key.canonicalPath} → ${it.value}" 
+            }
+            
+            val dockerInfo = buildString {
+                if (dockerfileContent != null) {
+                    appendLine("### Dockerfile contents")
+                    appendLine("```dockerfile")
+                    appendLine(dockerfileContent.trim())
+                    appendLine("```")
+                    appendLine()
+                }
+                if (volumesInfo.isNotEmpty()) {
+                    appendLine("### Mounted volumes")
+                    appendLine(volumesInfo)
+                    appendLine()
+                    appendLine("IMPORTANT: When referencing files in your script, you MUST translate host paths to container paths using the volume mappings above.")
+                    appendLine("Replace the host path prefix with the corresponding container path.")
+                    appendLine()
+                    appendLine("Example:")
+                    appendLine("- User asks for: /home/nmp/work/git/al/my-copilot/tests/temp/example.docx")
+                    appendLine("- Volume mapping: /home/nmp/work/git/al → /workspace")
+                    appendLine("- You must use in script: /workspace/my-copilot/tests/temp/example.docx")
+                    appendLine()
+                }
+            }
+
+            """
+            Executes a bash script inside a Docker container.
+            The container is pre-started with mounted volumes and persists between calls.
+            
+            ${dockerInfo.trim()}
+            
+            ### Params
+            - ${"scriptContent" from this} -- bash script to execute
+            
+            ### Returns
+            Exit code, stdout, and stderr (each truncated to 10000 chars).
+            """.trimIndent()
+        }
+
+        MainAgentTools::runPredefinedBash.defineDescription {
+            """
+            Используется для выполнения следующего предопределенного скрипта.
+
+            Команда запуска:
+            ```bash
+            ${predefinedBash()}
+            ```
+
+            ### Returns
+            Exit code, stdout, and stderr (each truncated to 10000 chars).
+            """.trimIndent()
+        }
+
     }
 }
 
 class MainAgentTools : ToolSet {
-    companion object {
-        private val readFiles = mutableSetOf<String>()
-    }
 
     @Tool
-    fun readFile(path: String, maxSizeText: Int): String {
-        readFiles.add(File(path).absolutePath)
+    fun readFile(path: String, readLimit: Int): String {
         val proposalFile = File("$path.proposal")
         val file = if (proposalFile.exists()) {
             info("readFile: proposal found")
@@ -564,10 +659,9 @@ class MainAgentTools : ToolSet {
         if (!file.exists()) return "ERROR: File doesn't exist"
         if (file.isDirectory) return "ERROR: It is a path, not a file"
         val fullText = file.readText()
-        val truncated = fullText.length > maxSizeText
-        val rawText = fullText.take(maxSizeText)
-        val redactedText = redaction.redactText(rawText)
-        val lines = redactedText.lines() // разбиваем на строки
+        val truncated = fullText.length > readLimit
+        val rawText = fullText.take(readLimit)
+        val lines = rawText.lines() // разбиваем на строки
         val numberedContent = lines.mapIndexed { index, line ->
             "${index + 1}: $line"
         }.joinToString("\n")
@@ -575,7 +669,7 @@ class MainAgentTools : ToolSet {
                 "Each line is prefixed with the line number followed by a colon. " +
                 "For example, `1: println(\"first line\")` means line number one contains " +
                 "the code `println(\"first line\")`.\n\n"
-        val truncationMessage = if (truncated) "Returned only first $maxSizeText characters of the file.\n\n" else ""
+        val truncationMessage = if (truncated) "Returned only first $readLimit characters of the file.\n\n" else ""
         return "$truncationMessage$lineNumberInstruction$numberedContent"
     }
 
@@ -596,7 +690,7 @@ class MainAgentTools : ToolSet {
             val nextLevelDirs = mutableListOf<File>()
 
             for (d in currentLevelDirs) {
-                val entries = d.listFiles()?.filter(::takeFileIf) ?: continue
+                val entries = d.listFiles()?.filter(::showFileWhileReadingDirectoryIf) ?: continue
                 levelCount += entries.size
                 for (entry in entries) {
                     if (entry.isDirectory) nextLevelDirs += entry
@@ -619,7 +713,7 @@ class MainAgentTools : ToolSet {
 
         fun render(file: File, prefix: String, depth: Int) {
             if (depth >= maxDepth) return
-            val entries = file.listFiles()?.filter(::takeFileIf)
+            val entries = file.listFiles()?.filter(::showFileWhileReadingDirectoryIf)
                 ?.sortedWith(compareBy({ !it.isDirectory }, { it.name }))
                 ?: return
 
@@ -713,14 +807,16 @@ class MainAgentTools : ToolSet {
     @Tool
     fun modifyFile(filePath: String, modificationsJson: String): String {
         val canonicalPath = File(filePath).absolutePath
-        val proposalFile = File("$filePath.proposal")
-        if (proposalFile.exists() && canonicalPath !in readFiles) {
-            return "ERROR: File '$filePath' has been modified. " +
-                    "You must read the current state first " +
-                    "before making further modifications."
+        val isDirect = directModificationPathList().any { path ->
+            val absPath = File(path).absolutePath
+            canonicalPath == absPath || canonicalPath.startsWith(absPath + File.separator)
         }
-        readFiles.remove(canonicalPath)
-        return proposalSubAgent.createProposal(filePath, modificationsJson)
+
+        return if (isDirect) {
+            proposalSubAgent.applyDirectly(filePath, modificationsJson)
+        } else {
+            proposalSubAgent.createProposal(filePath, modificationsJson)
+        }
     }
 
     @Tool
@@ -738,6 +834,71 @@ class MainAgentTools : ToolSet {
         } catch (e: Exception) {
             "ERROR: internet search failed: ${e.message}"
         }
+    }
+
+    private val fileAnalysisSubAgent = FileAnalysisSubAgent()
+
+    @Tool
+    fun analyzeImage(filePath: String, question: String): String {
+        info("Tool: analyzeFile -> $filePath")
+        return fileAnalysisSubAgent.analyzeFile(filePath, question)
+    }
+
+    private val dockerSandbox = DockerSandbox()
+
+    @Tool
+    fun runScript(scriptContent: String): String {
+        return dockerSandbox.exec(scriptContent)
+    }
+
+    @Tool
+    fun runPredefinedBash(): String {
+        return runHostProcess(predefinedBash())
+    }
+
+    private fun runHostProcess(command: String): String {
+        info("buildProject: running '$command'")
+        val processBuilder = ProcessBuilder("bash", "-c", command)
+        val process = processBuilder.start()
+
+        val stdout = StringBuilder()
+        val stderr = StringBuilder()
+
+        val stdoutThread = thread(name = "host-stdout") {
+            process.inputStream.bufferedReader().forEachLine { line ->
+                stdout.appendLine(line)
+            }
+        }
+        val stderrThread = thread(name = "host-stderr") {
+            process.errorStream.bufferedReader().forEachLine { line ->
+                stderr.appendLine(line)
+            }
+        }
+
+        val timeoutSeconds = 60
+        val maxOutputLength = 10000
+        val finished = process.waitFor(timeoutSeconds.toLong(), TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            stdoutThread.join(2000)
+            stderrThread.join(2000)
+            return "ERROR: command timed out after ${timeoutSeconds}s\n" +
+                    "stdout: ${stdout.toString().take(maxOutputLength)}\n" +
+                    "stderr: ${stderr.toString().take(maxOutputLength)}"
+        }
+
+        stdoutThread.join(5000)
+        stderrThread.join(5000)
+
+        val exitCode = process.exitValue()
+        val stdoutStr = stdout.toString().take(maxOutputLength)
+        val stderrStr = stderr.toString().take(maxOutputLength)
+
+        return buildString {
+            appendLine("Exit code: $exitCode")
+            if (stdoutStr.isNotBlank()) appendLine("\n--- stdout ---\n$stdoutStr")
+            if (stderrStr.isNotBlank()) appendLine("\n--- stderr ---\n$stderrStr")
+        }.trimEnd()
     }
 }
 
@@ -837,10 +998,12 @@ class ProposalSubAgent {
             originalFile.parentFile,
             "${originalFile.name}.proposal"
         )
-
         if (!proposalFile.exists()) {
             if (originalFile.exists()) originalFile.copyTo(proposalFile, overwrite = true)
-            else proposalFile.writeText("")
+            else {
+                originalFile.writeText("")
+                proposalFile.writeText("")
+            }
         }
 
         val modificationList = llmCommon.correctJson<MainAgentTools.ModificationList>(modificationsJson)
@@ -851,6 +1014,24 @@ class ProposalSubAgent {
 
         applyModifications(proposalFile, modificationList.modifications)
         return "File ${originalFile.absolutePath} was successfully modified"
+    }
+
+    fun applyDirectly(originalFilePath: String, modificationsJson: String): String {
+        val originalFile = File(originalFilePath)
+
+        if (!originalFile.exists()) {
+            originalFile.parentFile?.mkdirs()
+            originalFile.writeText("")
+        }
+
+        val modificationList = llmCommon.correctJson<MainAgentTools.ModificationList>(modificationsJson)
+            ?: return "ERROR: Couldn't parse modifications JSON even after LLM correction"
+
+        val validationError = validateModifications(modificationList.modifications)
+        if (validationError != null) return "ERROR: $validationError"
+
+        applyModifications(originalFile, modificationList.modifications)
+        return "File ${originalFile.absolutePath} was successfully modified (direct)"
     }
 }
 
@@ -891,10 +1072,156 @@ class SearchSubAgent {
     }
 }
 
+class FileAnalysisSubAgent {
+
+    fun analyzeFile(filePath: String, question: String): String {
+        val file = File(filePath)
+        if (!file.exists()) return "ERROR: Файл не найден: $filePath"
+        if (file.length() > 15_000_000) return "ERROR: Файл слишком большой (>15MB)"
+
+        val ext = file.extension.lowercase()
+        return when (ext) {
+            "jpg", "jpeg", "png", "svg" -> analyzeImage(file, question)
+            else -> "ERROR: Неподдерживаемый тип файла. Поддерживаются только: jpg, jpeg, png, svg"
+        }
+    }
+
+    private fun analyzeImage(file: File, question: String): String {
+        info("Analyzing image: ${file.name}")
+        val prompt = Prompt.build(id = "image-analysis") {
+            system("Ты эксперт по анализу изображений. Внимательно изучи изображение и ответь на вопрос пользователя максимально подробно.")
+            user {
+                text(question)
+                image(KPath(file.absolutePath))
+            }
+        }
+        return runBlocking {
+            val executor = llmCommon.executor(providerTuning())
+            val response = executor.execute(prompt, currentModel())
+            response.parts
+                .filterIsInstance<MessagePart.Text>()
+                .joinToString("\n\n") { it.text }
+        }
+    }
+}
+
+class DockerSandbox {
+    private val containerName = "my-copilot-sandbox-${ProcessHandle.current().pid()}"
+    private val dockerImage = "my-copilot-sandbox"
+    private val scriptTimeoutSeconds = 60
+    private val maxScriptOutputLength = 10000
+
+    fun start() {
+        val dockerfilePath = File("Dockerfile")
+        info("DockerSandbox: building image '$dockerImage' from ${dockerfilePath.absoluteFile.parent}")
+        val buildProcess = ProcessBuilder("docker", "build", "-t", dockerImage, dockerfilePath.absoluteFile.parent)
+            .inheritIO()
+            .start()
+        val buildExitCode = buildProcess.waitFor()
+        if (buildExitCode != 0) {
+            error("DockerSandbox: docker build failed with exit code $buildExitCode")
+        }
+
+        val volumeArgs = dockerVolumes().flatMap { (hostFile, containerPath) ->
+            listOf("-v", "${hostFile.absolutePath}:$containerPath")
+        }
+
+        info("DockerSandbox: starting container '$containerName'")
+        val runResult = runProcess(
+            listOf("docker", "run", "-d", "--name", containerName) +
+                    volumeArgs +
+                    listOf(dockerImage, "sleep", "infinity")
+        )
+        if (runResult.exitCode != 0) {
+            error("DockerSandbox: docker run failed:\n${runResult.stderr}")
+        }
+        info("DockerSandbox: container '$containerName' started")
+    }
+
+    fun exec(script: String): String {
+        info("DockerSandbox: exec in '$containerName'")
+
+        val processBuilder = ProcessBuilder(
+            "docker", "exec", containerName, "bash", "-c", script
+        )
+        val process = processBuilder.start()
+
+        val stdout = StringBuilder()
+        val stderr = StringBuilder()
+
+        val stdoutThread = thread(name = "docker-stdout") {
+            process.inputStream.bufferedReader().forEachLine { line ->
+                stdout.appendLine(line)
+            }
+        }
+        val stderrThread = thread(name = "docker-stderr") {
+            process.errorStream.bufferedReader().forEachLine { line ->
+                stderr.appendLine(line)
+            }
+        }
+
+        val finished = process.waitFor(scriptTimeoutSeconds.toLong(), TimeUnit.SECONDS)
+        if (!finished) {
+            process.destroyForcibly()
+            stdoutThread.join(2000)
+            stderrThread.join(2000)
+            return "ERROR: script timed out after ${scriptTimeoutSeconds}s\n" +
+                    "stdout: ${stdout.toString().take(maxScriptOutputLength)}\n" +
+                    "stderr: ${stderr.toString().take(maxScriptOutputLength)}"
+        }
+
+        stdoutThread.join(5000)
+        stderrThread.join(5000)
+
+        val exitCode = process.exitValue()
+        val stdoutStr = stdout.toString().take(maxScriptOutputLength)
+        val stderrStr = stderr.toString().take(maxScriptOutputLength)
+
+        return buildString {
+            appendLine("Exit code: $exitCode")
+            if (stdoutStr.isNotBlank()) appendLine("\n--- stdout ---\n$stdoutStr")
+            if (stderrStr.isNotBlank()) appendLine("\n--- stderr ---\n$stderrStr")
+        }.trimEnd()
+    }
+
+    fun stop() {
+        info("DockerSandbox: stopping container '$containerName'")
+        runProcess("docker", "rm", "-f", containerName)
+    }
+
+    private data class ProcessResult(val exitCode: Int, val stdout: String, val stderr: String)
+
+    private fun runProcess(vararg command: String): ProcessResult =
+        runProcess(command.toList())
+
+    private fun runProcess(command: List<String>): ProcessResult {
+        val process = ProcessBuilder(command).start()
+
+        val stdout = StringBuilder()
+        val stderr = StringBuilder()
+
+        val stdoutThread = thread(name = "process-stdout") {
+            process.inputStream.bufferedReader().forEachLine { line ->
+                stdout.appendLine(line)
+            }
+        }
+        val stderrThread = thread(name = "process-stderr") {
+            process.errorStream.bufferedReader().forEachLine { line ->
+                stderr.appendLine(line)
+            }
+        }
+
+        process.waitFor(300, TimeUnit.SECONDS)
+        stdoutThread.join(5000)
+        stderrThread.join(5000)
+
+        return ProcessResult(process.exitValue(), stdout.toString(), stderr.toString())
+    }
+}
+
 fun mainAgent() = AIAgent(
     promptExecutor = llmCommon.executor(providerTuning()),
     strategy = functionalStrategy<String, String> { input ->
-
         llm().writeSession {
             for ((role, content) in llmCommon.run { parsePromptWithMarkers(input) }) {
                 appendPrompt {
@@ -913,12 +1240,135 @@ fun mainAgent() = AIAgent(
             val shouldGoOn: Boolean
         )
 
-        fun checkRules(toolCalls: List<MessagePart.Tool.Call>): List<String> {
-            val violations = mutableListOf<String>()
-            return violations
+        class Hooker(private val context: AIAgentLLMContext) {
+            suspend fun beforeExecution(toolCalls: List<MessagePart.Tool.Call>): List<String> {
+                val ruleReadBeforeModifyViolations = toolCalls
+                    .filter { it.tool == "modifyFile" }
+                    .filter { call ->
+                        val filePath = llmCommon.getToolCallParam(call, "filePath")?.let { File(it).absolutePath }
+                        val readFiles = llmCommon.getToolCallArgs(llm(), "readFile", "path")
+                            .map { File(it.second).absolutePath }.toSet()
+                        filePath != null && filePath !in readFiles
+                    }
+                    .map { call ->
+                        val filePath = llmCommon.getToolCallParam(call, "filePath") ?: "unknown"
+                        "File '$filePath' cannot be modified because it was not read first"
+                            .apply { info(this) }
+                    }
+                val hasCurrentModify = toolCalls.any { it.tool == "modifyFile" }
+                val ruleReadAfterModifyViolations = if (hasCurrentModify) {
+                    emptyList()
+                } else {
+                    llmCommon.getToolCallArgs(llm(), "modifyFile", "filePath")
+                        .filter { (msgNum, filePath) ->
+                            val absFilePath = File(filePath).absolutePath
+                            val laterReads = llmCommon.getToolCallArgs(llm(), "readFile", "path")
+                                .filter { (readMsgNum, readPath) ->
+                                    readMsgNum > msgNum && File(readPath).absolutePath == absFilePath
+                                }
+                            laterReads.isEmpty()
+                        }
+                        .map { (msgNum, filePath) ->
+                            "File '$filePath' was modified at message $msgNum but not read afterwards"
+                                .apply { info(this) }
+                        }
+                }
+
+                return ruleReadBeforeModifyViolations + ruleReadAfterModifyViolations
+            }
+
+
+            suspend fun removeSupersededReadFileResults() {
+                context.writeSession {
+                    data class ReadResult(val msgIndex: Int, val partIndex: Int, val filePath: String)
+
+                    val results = mutableListOf<ReadResult>()
+
+                    prompt.messages.forEachIndexed { msgIdx, msg ->
+                        if (msg is Message.User) {
+                            msg.parts.forEachIndexed { partIdx, part ->
+                                if (part is MessagePart.Tool.Result && part.tool == "readFile") {
+                                    val call = prompt.messages.asSequence()
+                                        .take(msgIdx)
+                                        .filterIsInstance<Message.Assistant>()
+                                        .flatMap { it.parts.asSequence() }
+                                        .filterIsInstance<MessagePart.Tool.Call>()
+                                        .find { it.tool == "readFile" && it.id == part.id }
+
+                                    val filePath = call?.let { llmCommon.getToolCallParam(it, "path") }?.let { File(it).absolutePath }
+                                    if (filePath != null) {
+                                        results.add(ReadResult(msgIdx, partIdx, filePath))
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    val toReplace = results
+                        .groupBy { it.filePath }
+                        .values
+                        .flatMap { it.sortedBy { r -> r.msgIndex }.dropLast(1) }
+
+                    if (toReplace.isEmpty()) return@writeSession
+
+                    val newMessages = prompt.messages.mapIndexed { msgIdx, msg ->
+                        if (msg is Message.User) {
+                            val newParts = msg.parts.mapIndexed { partIdx, part ->
+                                if (part is MessagePart.Tool.Result && toReplace.any { it.msgIndex == msgIdx && it.partIndex == partIdx }) {
+                                    MessagePart.Tool.Result(
+                                        id = part.id,
+                                        tool = part.tool,
+                                        output = "[superseded - file was read again later]"
+                                    )
+                                } else part
+                            }
+                            msg.copy(parts = newParts)
+                        } else msg
+                    }
+
+                    info("Replaced ${toReplace.size} superseded readFile results")
+                    prompt = prompt.withMessages { newMessages }
+                }
+            }
+
+            fun processResults(results: List<MessagePart.Tool.Result>): List<MessagePart.Tool.Result> {
+                return results
+            }
+
+            suspend fun redactPrompt() {
+                context.writeSession {
+                    val newMessages = prompt.messages.map { msg ->
+                        when (msg) {
+                            is Message.User -> msg.copy(parts = msg.parts.map { redactRequestPart(it) })
+                            is Message.Assistant -> msg.copy(parts = msg.parts.map { redactResponsePart(it) })
+                            else -> msg
+                        }
+                    }
+                    prompt = prompt.withMessages { newMessages }
+                }
+            }
+
+            private fun redactRequestPart(part: MessagePart.RequestPart): MessagePart.RequestPart = when (part) {
+                is MessagePart.Text -> part.copy(text = redaction.redactText(part.text))
+                is MessagePart.Tool.Result -> part.copy(parts = part.parts.map { redactContentPart(it) })
+                else -> part
+            }
+
+            private fun redactResponsePart(part: MessagePart.ResponsePart): MessagePart.ResponsePart = when (part) {
+                is MessagePart.Text -> part.copy(text = redaction.redactText(part.text))
+                else -> part  // Tool.Call.args НЕ трогаем — иначе сломаются инструменты
+            }
+
+            private fun redactContentPart(part: MessagePart.ContentPart): MessagePart.ContentPart = when (part) {
+                is MessagePart.Text -> part.copy(text = redaction.redactText(part.text))
+                else -> part
+            }
         }
 
+        val hooker = Hooker(llm())
+
         suspend fun callAndLog(iteration: Int): CallResult {
+            hooker.redactPrompt()
             val response1 = llm().writeSession { requestLLMStreaming() }
             val response2 = response1.toList()
             val response = response2.toMessageResponse()
@@ -929,38 +1379,35 @@ fun mainAgent() = AIAgent(
                         "Output: ${response.metaInfo.outputTokensCount}"
             )
             val toolCalls = response.parts.filterIsInstance<MessagePart.Tool.Call>()
-
-            // Check rules
-            val violations = checkRules(toolCalls)
+            val violations = hooker.beforeExecution(toolCalls)
             if (violations.isNotEmpty()) {
                 llm().writeSession {
                     appendPrompt { user("RULE VIOLATION: ${violations.joinToString("; ")}") }
                 }
                 return CallResult(response, emptyList(), true)
             }
-
             return CallResult(response, toolCalls, toolCalls.isNotEmpty())
         }
-
         var iteration = 1
         var lastResponse: Message.Assistant? = null
-
         while (iteration < 30) {
             val result = callAndLog(iteration)
             lastResponse = result.response
-
             if (result.toolCalls.isNotEmpty()) {
                 executeTools(result.toolCalls).let { results ->
-                    val clarificationQuestion = results.firstNotNullOfOrNull { result ->
-                        result.toMessagePart()
-                            .output.removeSurrounding("\"")
+                    val processedResults = hooker.processResults(results.map { it.toMessagePart() })
+
+                    val clarificationQuestion = processedResults.firstNotNullOfOrNull { result ->
+                        result.output.removeSurrounding("\"")
                             .takeIf { it.startsWith("CLARIFICATION_REQUESTED:") }
                             ?.removePrefix("CLARIFICATION_REQUESTED:")?.trim()
                     }
-                    if (clarificationQuestion != null) return@functionalStrategy clarificationQuestion
+                    if (clarificationQuestion != null)
+                        return@functionalStrategy clarificationQuestion.replace("""\n""", "\n")
                     appendPrompt {
-                        user { results.forEach { toolResult(it.toMessagePart()) } }
+                        user { processedResults.forEach { toolResult(it) } }
                     }
+                    hooker.removeSupersededReadFileResults()
                 }
                 llmCommon.saveCurrentPrompt(
                     promptFilePath(),
@@ -982,7 +1429,7 @@ fun mainAgent() = AIAgent(
     agentConfig = AIAgentConfig(
         prompt = Prompt.build(id = "agent-1") {
             val toolPrompts = currentTools().mapNotNull { toolRef ->
-                prompts.run { toolRef.description() }
+                prompts.run { toolRef.description() } // .apply {println(this)}
             }.ifEmpty { null }?.joinToString("\n\n------\n\n")
             system(
                 "Ты агент-ассистент. Окажи максимальную поддержку" +
@@ -1006,9 +1453,6 @@ fun mainAgent() = AIAgent(
                     .joinToString("\n") { "${it.first}\n${it.second}" }
                 info("Tool: ${eventContext.toolName}\n$args")
             }
-            onToolCallCompleted { eventContext ->
-                // Here saving fact of tool calling
-            }
         }
     }
 )
@@ -1024,20 +1468,34 @@ if (mainCycle()) run {
         }
         kotlin.system.exitProcess(1)
     }
-    info("start v1")
-    val response =
-        runBlocking { mainAgent().run(promptFileObj.readText()) }
-    llmCommon.apply { outputAnswer(response, promptFileObj) }
+    info("start v1.0.1")
+    val sandboxEnabled = currentTools().any { it.name == "runScript" }
+    val sandbox = if (sandboxEnabled) DockerSandbox().also { it.start() } else null
+    try {
+        val response =
+            runBlocking { mainAgent().run(promptFileObj.readText()) }
+        llmCommon.apply { outputAnswer(response, promptFileObj) }
+    } finally {
+        sandbox?.stop()
+    }
     info("finish")
 }
 
+class CModels {
+    val standardCapabilities: List<LLMCapability> = listOf(
+        LLMCapability.Schema.JSON.Standard,
+        LLMCapability.Completion,
+        LLMCapability.Tools,
+        LLMCapability.ToolChoice,
+        LLMCapability.Vision.Image
+    )
+}
 // ========== Tuning agent =============
-
+fun mainCycle() = true
 fun promptFilePath() = args[0]
 fun providerTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
     it["enable_thinking"] = JsonPrimitive(true)
 }
-
 fun searchProviderTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
     it["enable_thinking"] = JsonPrimitive(true)
     it["enable_search"] = JsonPrimitive(true)
@@ -1048,19 +1506,23 @@ fun searchProviderTuning() = ProviderTuning(clientClass = DashscopeLLMClient::cl
         )
     )
 }
-fun searchModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
 
-fun currentModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
-fun maxSizeText() = 40000
-fun currentTools() = setOf<KFunction<String>>(
-    MainAgentTools::readFile,
-//    MainAgentTools::readDirectory,
-    MainAgentTools::modifyFile,
-    MainAgentTools::askForClarification,
-    MainAgentTools::searchInternet
-)
-
-fun mainCycle() = true
-
-fun takeFileIf(file: File): Boolean =
+fun showFileWhileReadingDirectoryIf(file: File): Boolean =
     !file.name.startsWith(".") && file.extension != "proposal"
+fun dockerVolumes() = mapOf(File("..").canonicalFile to "/workspace")
+fun directModificationPathList() = listOf<String>(
+)
+fun startReadLimit() = 40000
+fun searchModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
+fun currentModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus", capabilities = CModels().standardCapabilities)
+fun currentTools() = setOf<KFunction<String>>(
+//    MainAgentTools::readFile,
+//    MainAgentTools::readDirectory,
+//    MainAgentTools::modifyFile,
+//    MainAgentTools::askForClarification,
+//    MainAgentTools::searchInternet,
+//    MainAgentTools::analyzeImage,
+//    MainAgentTools::runPredefinedBash,
+    MainAgentTools::runScript
+)
+fun predefinedBash() = """cat /etc/os-release""".trimIndent()
