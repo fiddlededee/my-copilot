@@ -1516,13 +1516,13 @@ fun startReadLimit() = 40000
 fun searchModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
 fun currentModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus", capabilities = CModels().standardCapabilities)
 fun currentTools() = setOf<KFunction<String>>(
-//    MainAgentTools::readFile,
-//    MainAgentTools::readDirectory,
-//    MainAgentTools::modifyFile,
-//    MainAgentTools::askForClarification,
+    MainAgentTools::readFile,
+    MainAgentTools::readDirectory,
+    MainAgentTools::modifyFile,
+    MainAgentTools::askForClarification,
 //    MainAgentTools::searchInternet,
 //    MainAgentTools::analyzeImage,
 //    MainAgentTools::runPredefinedBash,
-    MainAgentTools::runScript
+//    MainAgentTools::runScript
 )
 fun predefinedBash() = """cat /etc/os-release""".trimIndent()
