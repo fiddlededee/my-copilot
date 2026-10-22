@@ -1,3 +1,11 @@
+// Doc hint: my way to run is
+// Doc hint: my way to run is kotlin -Xplugin [kotlin-path/lib/kotlinx-serialization-compiler-plugin.jar some-path/copilot-v2.main.kts some-path/some-diaologue.md
+// Doc hint: structured output won't work without kotlinx serialization compiler plugin
+// Doc hint: the best way is to use with some IDE and a hotkey
+// Doc hint: my approach for Open-IDE, IntelliJ -- with external tools
+// Doc hint: my approach for VS Code -- with VS Code tasks
+// Doc hint: I usually place the copilot, Dockerfile and `.env` and diologue files into project assistant folder
+// Doc hint: standard LLM Providers are just for example, you may use any provider supported by Koog
 @file:CompilerOptions("-jvm-target", "17")
 @file:DependsOn("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 @file:DependsOn("ai.koog:prompt-executor-dashscope-client-jvm:1.3.0-beta")
@@ -29,7 +37,6 @@ import io.ktor.client.engine.cio.CIO
 import ai.koog.http.client.ktor.KtorKoogHttpClient
 import ai.koog.prompt.Prompt
 import ai.koog.prompt.executor.clients.dashscope.DashscopeClientSettings
-import ai.koog.prompt.executor.clients.dashscope.DashscopeModels
 import ai.koog.prompt.executor.clients.openai.base.AbstractOpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.base.models.OpenAIBaseLLMResponse
 import ai.koog.prompt.executor.clients.openai.base.models.OpenAIBaseLLMStreamResponse
@@ -57,6 +64,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -78,18 +86,23 @@ import ai.koog.serialization.typeToken
 import kotlinx.schema.generator.json.JsonSchemaConfig
 import kotlinx.schema.json.JsonSchema
 import ai.koog.agents.features.eventHandler.feature.EventHandler
+import ai.koog.prompt.executor.clients.openrouter.OpenRouterModels
 import ai.koog.prompt.llm.LLMCapability
 import kotlinx.io.files.Path as KPath
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
+val version="v1.1.0"
+
 data class ProviderTuning(
     val clientClass: KClass<out AbstractOpenAILLMClient<*, *>>,
     val baseUrl: String? = null,
+    val chatCompletionsPath: String? = null,
     val requestModifier: (MutableMap<String, JsonElement>) -> Unit = {},
 )
 
 val llmCommon = LlmCommon()
+
 class LlmCommon {
     fun executor(providerTuning: ProviderTuning): PromptExecutor {
         return PromptExecutor.builder().addClient(createClient(providerTuning)).build()
@@ -107,7 +120,9 @@ class LlmCommon {
                 OpenRouterLLMClient(
                     settings = OpenRouterClientSettings(
                         baseUrl = tuning.baseUrl ?: default.baseUrl,
+                        chatCompletionsPath = tuning.chatCompletionsPath ?: default.chatCompletionsPath,
                     ),
+                    // Doc hint: ORKEY because Open Router Koog adapter is used, but it is a key of any provider
                     apiKey = dotenv()["ORKEY"],
                     httpClientFactory = factory
                 )
@@ -154,6 +169,7 @@ class LlmCommon {
                             }
                         }
                     }
+
                     is Message.Assistant -> {
                         message.parts.forEach { part ->
                             append("# As\n\n")
@@ -166,6 +182,7 @@ class LlmCommon {
                             }
                         }
                     }
+
                     else -> {}
                 }
             }
@@ -285,7 +302,6 @@ class LlmCommon {
             scope.requestPipeline.intercept(HttpRequestPipeline.Transform) {
                 val body = context.body as? String
                 if (body != null) {
-//                    info("Original request body:\n$body")
                     val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
                     val tree = json.parseToJsonElement(body).jsonObject.toMutableMap()
                     requestModifier(tree)
@@ -312,11 +328,14 @@ class LlmCommon {
                 val loggingSession = object : SSESession by session {
                     override val incoming: Flow<ServerSentEvent> =
                         session.incoming.map { event ->
-                            // Workaround for Koog bug: DashScope sends "content":"" (empty string)
-                            // in tool call chunks, which causes StreamFrameFlowBuilder to prematurely
-                            // flush pending tool calls with incomplete arguments.
-                            event.copy(data = event.data?.replace("\"content\":\"\"", "\"content\":null"))
-                        }.onEach { monitoring.processEvent(it.data) }
+                            // Doc hint: Koog Adapter and LLM Providers have different view on OpenAI API
+                            event.copy(
+                                data = event.data
+                                    ?.replace("\"content\":\"\"", "\"content\":null")
+                                    ?.replace("\"content\": \"\"", "\"content\":null")
+                                    ?.replace("\"reasoning\":\"\"", "\"reasoning\":null")
+                            )
+                        }.onEach { /* println("sse: ${it.data}"); */  monitoring.processEvent(it.data) }
                             .onCompletion { monitoring.flushAll() }
                 }
                 proceedWith(HttpResponseContainer(container.expectedType, loggingSession))
@@ -416,8 +435,9 @@ class Monitoring {
 
         val id = root["id"]?.jsonPrimitive?.content ?: return
         val reasoning = delta["reasoning_content"]?.jsonPrimitive?.contentOrNull
+            ?: delta["reasoning"]?.jsonPrimitive?.contentOrNull
         val content = delta["content"]?.jsonPrimitive?.contentOrNull
-        val hasTcDelta = delta["tool_calls"]?.jsonArray?.isNotEmpty() ?: false
+        val hasTcDelta = delta["tool_calls"]?.let { it is JsonArray && it.isNotEmpty() } ?: false
 
         val progress = progressMap.getOrPut(id) { ResponseProgress() }
         reasoning?.let(progress::appendReasoning)
@@ -589,10 +609,10 @@ class Prompts {
 
         MainAgentTools::runScript.defineDescription {
             val dockerfileContent = File("Dockerfile").takeIf { it.exists() }?.readText()
-            val volumesInfo = dockerVolumes().entries.joinToString("\n") { 
-                "  - ${it.key.canonicalPath} → ${it.value}" 
+            val volumesInfo = dockerVolumes().entries.joinToString("\n") {
+                "  - ${it.key.canonicalPath} → ${it.value}"
             }
-            
+
             val dockerInfo = buildString {
                 if (dockerfileContent != null) {
                     appendLine("### Dockerfile contents")
@@ -609,9 +629,9 @@ class Prompts {
                     appendLine("Replace the host path prefix with the corresponding container path.")
                     appendLine()
                     appendLine("Example:")
-                    appendLine("- User asks for: /home/nmp/work/git/al/my-copilot/tests/temp/example.docx")
-                    appendLine("- Volume mapping: /home/nmp/work/git/al → /workspace")
-                    appendLine("- You must use in script: /workspace/my-copilot/tests/temp/example.docx")
+                    appendLine("- User asks for: /my-home-dir/my-project/example.docx")
+                    appendLine("- Volume mapping: /my-home-dir/my-project → /workspace")
+                    appendLine("- You must use in script: /workspace/example.docx")
                     appendLine()
                 }
             }
@@ -626,21 +646,21 @@ class Prompts {
             - ${"scriptContent" from this} -- bash script to execute
             
             ### Returns
-            Exit code, stdout, and stderr (each truncated to 10000 chars).
+            Exit code, stdout, and stderr (each truncated to ${scriptOutputLimit()} chars).
             """.trimIndent()
         }
 
-        MainAgentTools::runPredefinedBash.defineDescription {
+        MainAgentTools::runPredefinedCommand.defineDescription {
             """
             Используется для выполнения следующего предопределенного скрипта.
 
             Команда запуска:
             ```bash
-            ${predefinedBash()}
+            ${predefinedCommand()}
             ```
 
             ### Returns
-            Exit code, stdout, and stderr (each truncated to 10000 chars).
+            Exit code, stdout, and stderr (each truncated to ${scriptOutputLimit()} chars).
             """.trimIndent()
         }
 
@@ -852,8 +872,8 @@ class MainAgentTools : ToolSet {
     }
 
     @Tool
-    fun runPredefinedBash(): String {
-        return runHostProcess(predefinedBash())
+    fun runPredefinedCommand(): String {
+        return runHostProcess(predefinedCommand())
     }
 
     private fun runHostProcess(command: String): String {
@@ -876,7 +896,7 @@ class MainAgentTools : ToolSet {
         }
 
         val timeoutSeconds = 60
-        val maxOutputLength = 10000
+        val maxOutputLength = scriptOutputLimit()
         val finished = process.waitFor(timeoutSeconds.toLong(), TimeUnit.SECONDS)
         if (!finished) {
             process.destroyForcibly()
@@ -1109,7 +1129,7 @@ class DockerSandbox {
     private val containerName = "my-copilot-sandbox-${ProcessHandle.current().pid()}"
     private val dockerImage = "my-copilot-sandbox"
     private val scriptTimeoutSeconds = 60
-    private val maxScriptOutputLength = 10000
+    private val maxScriptOutputLength = scriptOutputLimit()
 
     fun start() {
         val dockerfilePath = File("Dockerfile")
@@ -1262,6 +1282,11 @@ fun mainAgent() = AIAgent(
                     llmCommon.getToolCallArgs(llm(), "modifyFile", "filePath")
                         .filter { (msgNum, filePath) ->
                             val absFilePath = File(filePath).absolutePath
+                            val isDirectPath = directModificationPathList().any { directPath ->
+                                val absDirectPath = File(directPath).absolutePath
+                                absFilePath == absDirectPath || absFilePath.startsWith(absDirectPath + File.separator)
+                            }
+                            if (isDirectPath) return@filter false
                             val laterReads = llmCommon.getToolCallArgs(llm(), "readFile", "path")
                                 .filter { (readMsgNum, readPath) ->
                                     readMsgNum > msgNum && File(readPath).absolutePath == absFilePath
@@ -1295,7 +1320,8 @@ fun mainAgent() = AIAgent(
                                         .filterIsInstance<MessagePart.Tool.Call>()
                                         .find { it.tool == "readFile" && it.id == part.id }
 
-                                    val filePath = call?.let { llmCommon.getToolCallParam(it, "path") }?.let { File(it).absolutePath }
+                                    val filePath = call?.let { llmCommon.getToolCallParam(it, "path") }
+                                        ?.let { File(it).absolutePath }
                                     if (filePath != null) {
                                         results.add(ReadResult(msgIdx, partIdx, filePath))
                                     }
@@ -1388,6 +1414,7 @@ fun mainAgent() = AIAgent(
             }
             return CallResult(response, toolCalls, toolCalls.isNotEmpty())
         }
+
         var iteration = 1
         var lastResponse: Message.Assistant? = null
         while (iteration < 30) {
@@ -1433,7 +1460,8 @@ fun mainAgent() = AIAgent(
             }.ifEmpty { null }?.joinToString("\n\n------\n\n")
             system(
                 "Ты агент-ассистент. Окажи максимальную поддержку" +
-                        "У тебя есть следующие инструменты: \n\n$toolPrompts "
+                        "У тебя есть следующие инструменты: \n\n$toolPrompts " +
+                        "Если в вопросе указаны относительные пути, ищи эти файлы здесь: ${basePath()}"
             )
         },
         model = currentModel(),
@@ -1468,7 +1496,7 @@ if (mainCycle()) run {
         }
         kotlin.system.exitProcess(1)
     }
-    info("start v1.0.1")
+    info("start $version")
     val sandboxEnabled = currentTools().any { it.name == "runScript" }
     val sandbox = if (sandboxEnabled) DockerSandbox().also { it.start() } else null
     try {
@@ -1490,39 +1518,84 @@ class CModels {
         LLMCapability.Vision.Image
     )
 }
+
 // ========== Tuning agent =============
+// Doc hint: to providers are payed special attention, because the work from Russia
 fun mainCycle() = true
 fun promptFilePath() = args[0]
-fun providerTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
-    it["enable_thinking"] = JsonPrimitive(true)
-}
-fun searchProviderTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
-    it["enable_thinking"] = JsonPrimitive(true)
-    it["enable_search"] = JsonPrimitive(true)
-    it["search_options"] = JsonObject(
-        mapOf(
-            "search_strategy" to JsonPrimitive("agent"),
-            "forced_search" to JsonPrimitive(true)
+
+// Doc hint: Dashscope -- very cheap with their token plan, my preference
+//fun providerTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
+//    it["enable_thinking"] = JsonPrimitive(true)
+//}
+
+// Doc hint: why Kodik Router -- the simplest way to use LLM in Russia (IMHO)
+// Doc hint: OpenRouterLLMClient is used because its API is close to Kodik Router
+// Doc hint: These very setting have nothing in common with Open Router as a provider
+// Doc hint: Although it may be used with Open Router as a provider in the same way
+fun providerTuning() = ProviderTuning(
+    clientClass = OpenRouterLLMClient::class,
+    baseUrl = "https://api.kodikrouter.ru",
+    chatCompletionsPath = "v1/chat/completions"
+//    baseUrl = "https://api.selectel.ru",
+//    chatCompletionsPath = "aig/v1/chat/completions"
+)
+
+//Doc hint: settings are specific for Alibaba cloud provider
+//fun searchProviderTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
+//    it["enable_thinking"] = JsonPrimitive(true)
+//    it["enable_search"] = JsonPrimitive(true)
+//    it["search_options"] = JsonObject(
+//        mapOf(
+//            "search_strategy" to JsonPrimitive("agent"),
+//            "forced_search" to JsonPrimitive(true)
+//        )
+//    )
+//}
+
+//Doc hint: settings are specific for Kodik router
+fun searchProviderTuning() = ProviderTuning(
+    clientClass = OpenRouterLLMClient::class,
+    baseUrl = "https://api.kodikrouter.ru",
+    chatCompletionsPath = "v1/chat/completions"
+) {
+    it["plugins"] = JsonArray(
+        listOf(
+            JsonObject(mapOf("id" to JsonPrimitive("web"))),
         )
     )
 }
 
 fun showFileWhileReadingDirectoryIf(file: File): Boolean =
     !file.name.startsWith(".") && file.extension != "proposal"
+
 fun dockerVolumes() = mapOf(File("..").canonicalFile to "/workspace")
+fun startReadLimit() = 40000
+fun scriptOutputLimit() = 100000
 fun directModificationPathList() = listOf<String>(
 )
-fun startReadLimit() = 40000
-fun searchModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus")
-fun currentModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus", capabilities = CModels().standardCapabilities)
+
+//fun currentModel() = DashscopeModels.QWEN3_MAX.copy(id = "qwen3.7-plus", capabilities = CModels().standardCapabilities)
+// Doc hint: why 2_5? ask Koog, I use this syntax as it is very short))
+fun currentModel() =
+    OpenRouterModels.Qwen2_5.copy(id = "qwen/qwen3.7-plus", capabilities = CModels().standardCapabilities)
+
+fun searchModel() = currentModel()
+fun basePath() = File("..").absolutePath
+
+// Doc hint: good idea to uncomment necessary tools for even each step in a diologue
 fun currentTools() = setOf<KFunction<String>>(
     MainAgentTools::readFile,
     MainAgentTools::readDirectory,
     MainAgentTools::modifyFile,
     MainAgentTools::askForClarification,
-//    MainAgentTools::searchInternet,
-//    MainAgentTools::analyzeImage,
-//    MainAgentTools::runPredefinedBash,
+    MainAgentTools::searchInternet,
+    MainAgentTools::analyzeImage,
+    MainAgentTools::runPredefinedCommand,
 //    MainAgentTools::runScript
 )
-fun predefinedBash() = """cat /etc/os-release""".trimIndent()
+
+fun predefinedCommand() = """
+    kotlin -version
+    curl https://raw.githubusercontent.com/fiddlededee/my-copilot/refs/heads/main/copilot-v2.main.kts
+    """.trimIndent()
