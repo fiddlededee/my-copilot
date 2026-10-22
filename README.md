@@ -10,5 +10,7 @@ Efficiency comes from understanding what is happening and treating the dialogue 
 
 [The release notes for current version](./doc/prepare-for-publishing-checklist-query.md)
 
-[For Windows and OpenIDE](./doc/README-OPENIDE-WINDOWS.md)
-[For Ubuntu and OpenIDE](./doc/README-OPENIDE-UBUNTU.md)
+### Quick start guide
+
+* [For Windows and OpenIDE](./doc/README-OPENIDE-WINDOWS.md)
+* [For Ubuntu and OpenIDE](./doc/README-OPENIDE-UBUNTU.md)
