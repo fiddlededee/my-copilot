@@ -1,12 +1,11 @@
 // Doc hint: my way to run is
-// Doc hint: my way to run is kotlin -Xplugin [kotlin-path/lib/kotlinx-serialization-compiler-plugin.jar some-path/copilot-v2.main.kts some-path/some-diaologue.md
-// Doc hint: structured output won't work without kotlinx serialization compiler plugin
 // Doc hint: the best way is to use with some IDE and a hotkey
 // Doc hint: my approach for Open-IDE, IntelliJ -- with external tools
 // Doc hint: my approach for VS Code -- with VS Code tasks
 // Doc hint: I usually place the copilot, Dockerfile and `.env` and diologue files into project assistant folder
 // Doc hint: standard LLM Providers are just for example, you may use any provider supported by Koog
 @file:CompilerOptions("-jvm-target", "17")
+@file:DependsOn("ru.fiddlededee.mycopilot:my-copilot-models:1.2.0")
 @file:DependsOn("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
 @file:DependsOn("ai.koog:prompt-executor-dashscope-client-jvm:1.3.0-beta")
 @file:DependsOn("ai.koog:prompt-executor-openrouter-client-jvm:1.3.0")
@@ -37,6 +36,7 @@ import io.ktor.client.engine.cio.CIO
 import ai.koog.http.client.ktor.KtorKoogHttpClient
 import ai.koog.prompt.Prompt
 import ai.koog.prompt.executor.clients.dashscope.DashscopeClientSettings
+import ai.koog.prompt.executor.clients.dashscope.DashscopeModels
 import ai.koog.prompt.executor.clients.openai.base.AbstractOpenAILLMClient
 import ai.koog.prompt.executor.clients.openai.base.models.OpenAIBaseLLMResponse
 import ai.koog.prompt.executor.clients.openai.base.models.OpenAIBaseLLMStreamResponse
@@ -61,7 +61,6 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonArray
@@ -79,20 +78,20 @@ import kotlin.collections.set
 import kotlin.reflect.KClass
 import kotlin.reflect.KFunction
 import kotlin.reflect.KParameter
-import ai.koog.agents.core.tools.annotations.InternalAgentToolsApi
-import ai.koog.agents.core.tools.schema.defaultJsonSchemaConfig
-import ai.koog.agents.core.tools.schema.getJsonSchema
-import ai.koog.serialization.typeToken
-import kotlinx.schema.generator.json.JsonSchemaConfig
-import kotlinx.schema.json.JsonSchema
 import ai.koog.agents.features.eventHandler.feature.EventHandler
 import ai.koog.prompt.executor.clients.openrouter.OpenRouterModels
 import ai.koog.prompt.llm.LLMCapability
 import kotlinx.io.files.Path as KPath
+
+import ru.fiddlededee.mycopilot.models.ModificationType
+import ru.fiddlededee.mycopilot.models.Modification
+import ru.fiddlededee.mycopilot.models.ModificationList
+import ru.fiddlededee.mycopilot.models.generateSchema
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-val version="v1.1.0"
+// Release hint: 1.2.0 no need for kotlinx serialization plugin
+val version="v1.2.0"
 
 data class ProviderTuning(
     val clientClass: KClass<out AbstractOpenAILLMClient<*, *>>,
@@ -240,56 +239,12 @@ class LlmCommon {
         file.writeText(updatedContent)
     }
 
-    @OptIn(InternalAgentToolsApi::class)
-    inline fun <reified T> generateSchema(
-        config: JsonSchemaConfig = defaultJsonSchemaConfig
-    ): String {
-        val schema = getJsonSchema(
-            typeToken = typeToken<T>(),
-            jsonSchemaConfig = config
+    inline fun <reified T> correctJson(jsonString: String): T? = runBlocking {
+        ru.fiddlededee.mycopilot.models.correctJson(
+            jsonString = jsonString,
+            executor = executor(providerTuning()),
+            model = currentModel()
         )
-        return Json { prettyPrint = true }
-            .encodeToString(JsonSchema.serializer(), schema)
-    }
-
-    inline fun <reified T> correctJson(jsonString: String): T? {
-        val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
-
-        try {
-            return json.decodeFromString<T>(jsonString)
-        } catch (_: Exception) {
-            info("correctJson: direct deserialization failed")
-        }
-
-        val cleaned = jsonString.trim()
-            .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-        try {
-            return json.decodeFromString<T>(cleaned)
-        } catch (e: Exception) {
-            info("correctJson: after markdown cleanup failed: ${e.message}")
-        }
-
-        info("correctJson: falling back to LLM correction")
-        return runBlocking {
-            val agent = AIAgent(
-                promptExecutor = executor(providerTuning()),
-                strategy = functionalStrategy<String, T?> { input ->
-                    requestLLMStructured<T>(
-                        "The following message contains JSON that couldn't be deserialized." +
-                                "\n\nCorrect it to match the required schema." +
-                                "\n\n# The JSON is:\n\n$input"
-                    ).getOrNull()?.data
-                },
-                agentConfig = AIAgentConfig(
-                    prompt = Prompt.build(id = "json-correction") {
-                        system("You are a helpful agent. Your task is to fix JSON errors.")
-                    },
-                    model = currentModel(),
-                    maxAgentIterations = 3
-                )
-            )
-            agent.run(jsonString)
-        }
     }
 
     inner class RequestModifierPlugin(val requestModifier: (MutableMap<String, JsonElement>) -> Unit) :
@@ -420,7 +375,7 @@ class Monitoring {
         val file = File(outputDir, "$id.md")
         val isFirstWrite = !file.exists()
         file.writeText(content)
-        if (isFirstWrite) info("Session log: file://${file.absolutePath}")
+        if (isFirstWrite) info("Session log: ${file.toURI()}")
     }
 
     fun processEvent(eventData: String?) {
@@ -536,7 +491,7 @@ class Prompts {
         }
 
         MainAgentTools::modifyFile.defineDescription {
-            val schema = llmCommon.generateSchema<MainAgentTools.ModificationList>()
+            val schema = generateSchema<ModificationList>()
             """
             Modifies a file by applying a list of modifications.
             The modifications are provided as a JSON string that must conform to the schema below.
@@ -766,61 +721,6 @@ class MainAgentTools : ToolSet {
     }
 
 
-    @Serializable
-    enum class ModificationType { APPEND, DELETE, REPLACE, REPLACE_IN_LINE }
-
-    @Serializable
-    @LLMDescription(
-        """
-        A single modification instruction for a file.
-        Exactly one of four operation types must be specified via the 'type' field.
-        Fields that are not relevant for the chosen type must be null.
-
-        - APPEND: Insert new content after a specific line.
-          Required: startLine (the line AFTER which to insert), contents (text to insert).
-          endLine, searchText, replacementText must be null.
-
-        - DELETE: Remove a contiguous range of lines.
-          Required: startLine (first line to delete), endLine (last line to delete, inclusive).
-          contents, searchText, replacementText must be null.
-
-        - REPLACE: Replace a contiguous range of lines with new content.
-          Required: startLine (first line to replace), endLine (last line to replace, inclusive),
-                    contents (replacement text).
-          searchText, replacementText must be null.
-
-        - REPLACE_IN_LINE: Find-and-replace a substring within a single line.
-          Required: startLine (the line number), searchText (substring to find),
-                    replacementText (substring to replace with).
-          endLine, contents must be null.
-        """
-    )
-    data class Modification(
-        @property:LLMDescription("The type of modification to perform.")
-        val type: ModificationType,
-
-        @property:LLMDescription("Line number (1-based) where the operation starts or applies.")
-        val startLine: Int?,
-
-        @property:LLMDescription("Line number (1-based, inclusive) where the operation ends. Used only for DELETE and REPLACE.")
-        val endLine: Int?,
-
-        @property:LLMDescription("Text content to insert or use as replacement. Used for APPEND and REPLACE.")
-        val contents: String?,
-
-        @property:LLMDescription("Substring to search for within a single line. Used only for REPLACE_IN_LINE.")
-        val searchText: String?,
-
-        @property:LLMDescription("Replacement substring for find-and-replace. Used only for REPLACE_IN_LINE.")
-        val replacementText: String?
-    )
-
-    @Serializable
-    @LLMDescription("A wrapper for a list of file modifications")
-    data class ModificationList(
-        @property:LLMDescription("List of modifications sorted by startLine descending (highest line numbers first)")
-        val modifications: List<Modification>
-    )
 
     private val proposalSubAgent = ProposalSubAgent()
 
@@ -924,11 +824,11 @@ class MainAgentTools : ToolSet {
 
 class ProposalSubAgent {
 
-    fun validateModifications(modifications: List<MainAgentTools.Modification>): String? {
+    fun validateModifications(modifications: List<Modification>): String? {
         for ((index, mod) in modifications.withIndex()) {
             val label = "Modification #${index + 1} (${mod.type})"
             when (mod.type) {
-                MainAgentTools.ModificationType.APPEND -> {
+                ModificationType.APPEND -> {
                     if (mod.startLine == null) return "$label: startLine is required"
                     if (mod.contents == null) return "$label: contents is required"
                     if (mod.endLine != null) return "$label: endLine must be null"
@@ -936,7 +836,7 @@ class ProposalSubAgent {
                     if (mod.replacementText != null) return "$label: replacementText must be null"
                 }
 
-                MainAgentTools.ModificationType.DELETE -> {
+                ModificationType.DELETE -> {
                     if (mod.startLine == null) return "$label: startLine is required"
                     if (mod.endLine == null) return "$label: endLine is required"
                     if (mod.contents != null) return "$label: contents must be null"
@@ -944,7 +844,7 @@ class ProposalSubAgent {
                     if (mod.replacementText != null) return "$label: replacementText must be null"
                 }
 
-                MainAgentTools.ModificationType.REPLACE -> {
+                ModificationType.REPLACE -> {
                     if (mod.startLine == null) return "$label: startLine is required"
                     if (mod.endLine == null) return "$label: endLine is required"
                     if (mod.contents == null) return "$label: contents is required"
@@ -952,7 +852,7 @@ class ProposalSubAgent {
                     if (mod.replacementText != null) return "$label: replacementText must be null"
                 }
 
-                MainAgentTools.ModificationType.REPLACE_IN_LINE -> {
+                ModificationType.REPLACE_IN_LINE -> {
                     if (mod.startLine == null) return "$label: startLine is required"
                     if (mod.searchText == null) return "$label: searchText is required"
                     if (mod.replacementText == null) return "$label: replacementText is required"
@@ -964,21 +864,21 @@ class ProposalSubAgent {
         return null
     }
 
-    fun applyModifications(file: File, modifications: List<MainAgentTools.Modification>) {
+    fun applyModifications(file: File, modifications: List<Modification>) {
         if (modifications.isEmpty()) return
         val lines = file.readLines().toMutableList()
         val sorted = modifications.sortedByDescending { it.startLine ?: 0 }
 
         for (mod in sorted) {
             when (mod.type) {
-                MainAgentTools.ModificationType.APPEND -> {
+                ModificationType.APPEND -> {
                     val insertIndex = mod.startLine ?: continue
                     val safeIndex = insertIndex.coerceIn(0, lines.size)
                     val linesToInsert = mod.contents?.lines() ?: emptyList()
                     if (linesToInsert.isNotEmpty()) lines.addAll(safeIndex, linesToInsert)
                 }
 
-                MainAgentTools.ModificationType.DELETE -> {
+                ModificationType.DELETE -> {
                     val startLine = mod.startLine ?: continue
                     val endLine = mod.endLine ?: startLine
                     val si = startLine - 1;
@@ -987,7 +887,7 @@ class ProposalSubAgent {
                         lines.subList(si, ei + 1).clear()
                 }
 
-                MainAgentTools.ModificationType.REPLACE -> {
+                ModificationType.REPLACE -> {
                     val startLine = mod.startLine ?: continue
                     val endLine = mod.endLine ?: startLine
                     val si = startLine - 1;
@@ -999,12 +899,12 @@ class ProposalSubAgent {
                     }
                 }
 
-                MainAgentTools.ModificationType.REPLACE_IN_LINE -> {
+                ModificationType.REPLACE_IN_LINE -> {
                     val lineIndex = (mod.startLine ?: continue) - 1
-                    if (lineIndex >= 0 && lineIndex < lines.size
-                        && mod.searchText != null && mod.replacementText != null
-                    ) {
-                        lines[lineIndex] = lines[lineIndex].replace(mod.searchText, mod.replacementText)
+                    val searchText = mod.searchText ?: continue
+                    val replacementText = mod.replacementText ?: continue
+                    if (lineIndex >= 0 && lineIndex < lines.size) {
+                        lines[lineIndex] = lines[lineIndex].replace(searchText, replacementText)
                     }
                 }
             }
@@ -1026,7 +926,7 @@ class ProposalSubAgent {
             }
         }
 
-        val modificationList = llmCommon.correctJson<MainAgentTools.ModificationList>(modificationsJson)
+        val modificationList = llmCommon.correctJson<ModificationList>(modificationsJson)
             ?: return "ERROR: Couldn't parse modifications JSON even after LLM correction"
 
         val validationError = validateModifications(modificationList.modifications)
@@ -1044,7 +944,7 @@ class ProposalSubAgent {
             originalFile.writeText("")
         }
 
-        val modificationList = llmCommon.correctJson<MainAgentTools.ModificationList>(modificationsJson)
+        val modificationList = llmCommon.correctJson<ModificationList>(modificationsJson)
             ?: return "ERROR: Couldn't parse modifications JSON even after LLM correction"
 
         val validationError = validateModifications(modificationList.modifications)
@@ -1595,7 +1495,9 @@ fun currentTools() = setOf<KFunction<String>>(
 //    MainAgentTools::runScript
 )
 
+// Doc hint: the example contents, in this case used to build documentation for this copilot
 fun predefinedCommand() = """
     kotlin -version
     curl https://raw.githubusercontent.com/fiddlededee/my-copilot/refs/heads/main/copilot-v2.main.kts
+    echo "ru.fiddlededee.mycopilot:my-copilot-models -> $(curl -s 'https://repo1.maven.org/maven2/ru/fiddlededee/mycopilot/my-copilot-models/maven-metadata.xml' | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' | paste -sd, - | sed 's/^$/None/')"
     """.trimIndent()
