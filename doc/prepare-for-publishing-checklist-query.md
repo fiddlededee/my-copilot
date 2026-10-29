@@ -80,7 +80,7 @@ All debug prints are commented out:
 
 ---
 
-## {#changes} Changes v1.1.0 → v1.2.0
+## <span id="changes"></span>Changes v1.1.0 → v1.2.0
 
 ### Key changes
 - **Shared models extracted to a Maven Central library.** `Modification`, `ModificationList`, `ModificationType`, `generateSchema<T>()`, and `correctJson<T>()` were moved out of the copilot script into `ru.fiddlededee.mycopilot:my-copilot-models:1.2.0`. The script now depends on this library instead of defining these types and utilities inline. This eliminates the need for the kotlinx-serialization compiler plugin when running the copilot script.
