@@ -9,13 +9,13 @@ To render answer for this and further questions read the whole file (limit -- 10
 
 # As
 
-## What is `copilot-v2.main.kts`?
+## What `copilot-v2.main.kts` Is For
 
-This script is a **self-contained AI coding assistant (copilot)** implemented as a Kotlin script. It uses the **Koog** framework (by JetBrains) to build an LLM-powered agent that can interact with your project: read files and directories, modify source code (via a structured JSON-based modification schema with line-level precision), search the internet, analyze images, and execute bash scripts inside a Docker sandbox. The agent operates in a loop — it reads a dialogue/prompt file (Markdown with `# Us` / `# As` markers), sends it to an LLM, executes any tool calls the model produces, feeds the results back, and repeats until the task is done (up to 30 iterations). The final answer is appended back to the prompt file, making it easy to continue the conversation.
+This script is a **self-contained AI coding assistant** (a "copilot") written as a Kotlin script. It spins up an LLM-powered agent (via the Koog framework) that reads a dialogue from a Markdown file, iteratively calls an LLM, executes tools on the user's behalf, and writes the assistant's response back into the same file. The intended workflow is to place the script alongside a `Dockerfile`, a `.env`, and a dialogue `.md` file in a project's assistant folder, then trigger it from an IDE hotkey (IntelliJ External Tools or VS Code Tasks) — essentially giving you a one-button "talk to your AI assistant" experience inside any project.
 
-The script includes several **safety and usability mechanisms**: a *proposal-based* file modification workflow (changes are written to `.proposal` files first, unless the target path is explicitly whitelisted for direct writes); a *read-before-modify* enforcement rule that prevents the agent from editing files it hasn't read; automatic **redaction of sensitive data** (API keys, passport numbers, credit cards, etc.) from prompts before they are sent to the LLM; and a monitoring subsystem that logs reasoning and tool-call traces to disk. Sub-agents handle web search and image analysis separately, keeping the main agent focused.
+The agent is equipped with a toolkit for **file-system and code manipulation**: reading files (with numbered lines), browsing directories, modifying files via a structured JSON schema (with a "proposal" mechanism that writes changes to a `.proposal` copy first unless the target is on a trusted path), searching the internet through a dedicated sub-agent, analyzing images, and running bash scripts inside a Docker sandbox. It also enforces guardrails — e.g., a file must be read before it can be modified, and sensitive data (PII, API keys) is redacted from the prompt before it is sent to the LLM. Session reasoning and tool-call logs are persisted to a `monitoring-output` directory for observability.
 
-As the *Doc hint* comments explain, the script is designed to be launched from an IDE via a hotkey (IntelliJ external tools or VS Code tasks), with the copilot script, a `Dockerfile`, a `.env` file, and dialogue files placed together in a "project assistant" folder. LLM provider configuration is tuned for accessibility from Russia — it uses **Kodik Router** (`api.kodikrouter.ru`) as the primary endpoint (with the OpenRouter-compatible API adapter) and **Dashscope** (Alibaba Cloud) as a cheaper alternative, running the **Qwen 3.7-plus** model. Standard LLM providers are included as examples; any provider supported by Koog can be swapped in.
+From an infrastructure standpoint, the script is **provider-agnostic** but ships with tuned presets for working from Russia (Kodik Router as an OpenRouter-compatible proxy, and Alibaba Dashscope as a cheap alternative). The LLM provider, model, tool set, and even MCP tool servers can be swapped by editing a small "tuning" section at the bottom of the file, making it a flexible, single-file alternative to heavier agent frameworks.
 
 # Us
 Draft a compact how to start guide for me, If I need to set up it in Ubuntu and OpenIDE
@@ -30,165 +30,168 @@ same copilot)
 
 # As
 
-Now I have all the data. Here's the guide:
+Now I have all the information. Here's the guide:
 
 ---
 
-# Copilot v2 — Quick Start Guide (Ubuntu + IntelliJ-based IDE)
+# copilot-v2 — Quick Start Guide (Ubuntu + IntelliJ IDEA)
 
-## Environment this guide was built with
-
+**Built with:**
 | Component | Version |
 |-----------|---------|
-| **OS** | Ubuntu (OpenJDK package `21.0.9+10-Ubuntu-125.04`) |
+| **OS** | Ubuntu 25.04 |
 | **Kotlin** | 2.3.21-release-298 |
-| **JRE / JDK** | 21.0.9 (OpenJDK) |
-| **Copilot script** | v1.2.0 |
-| **my-copilot-models** | 1.2.0 |
-
-> The script targets JVM 17 (`@file:CompilerOptions("-jvm-target", "17")`), so **JDK 17+ is required**. JDK 21 is recommended.
+| **Java (JRE)** | OpenJDK 21.0.9+10-Ubuntu |
 
 ---
 
-## 1. Install prerequisites
+## 1. Prerequisites
 
 ```bash
-# JDK 21
+# Java 21 (the script targets JVM 17, but 21 is recommended)
 sudo apt update && sudo apt install -y openjdk-21-jdk
 
-# Kotlin CLI (needed to run .main.kts scripts with dependency resolution)
-sudo snap install --classic kotlin
-# — or via SDKMAN:  sdk install kotlin
+# Kotlin (for running .kts scripts)
+sudo snap install kotlin --classic
+# — or via SDKMAN:
+# curl -s "https://get.sdkman.io" | bash && sdk install kotlin
 
-# Docker (for the sandboxed runScript tool — optional but recommended)
+# Docker (needed only if you plan to use the runScript tool / sandbox)
 sudo apt install -y docker.io
-sudo usermod -aG docker $USER   # log out/in afterwards
+sudo usermod -aG docker $USER   # log out & back in after this
 
 # Verify
-kotlin -version     # expect 2.x
-java -version       # expect 21.x
+kotlin -version    # expect 2.x
+java -version      # expect 21.x
 docker --version
 ```
 
----
+## 2. Project Layout
 
-## 2. Create the project assistant folder
+Create the **assistant folder** inside your project:
 
-The script is designed to live in a **subfolder** of your project. The parent directory (`..`) becomes the project root that the copilot sees and (optionally) mounts into Docker.
-
-```bash
-mkdir -p ~/my-projects/my-some-great-project/.assistant
-cd ~/my-projects/my-some-great-project/.assistant
+```
+~/my-projects/my-some-great-project/
+├── assistant/
+│   ├── copilot-v2.main.kts   ← the script (download from GitHub)
+│   ├── Dockerfile             ← sandbox image (optional, for runScript)
+│   ├── .env                   ← API keys
+│   └── prompt.md              ← your dialogue file
+├── src/...
+└── ...
 ```
 
-Place these files inside `.assistant/`:
-
-| File | Purpose |
-|------|---------|
-| `copilot-v2.main.kts` | The copilot script itself ([download](https://raw.githubusercontent.com/fiddlededee/my-copilot/refs/heads/main/copilot-v2.main.kts)) |
-| `.env` | API keys (see below) |
-| `Dockerfile` | Sandbox image definition (optional — only needed if `runScript` tool is enabled) |
-| `prompt.md` | Dialogue file — your conversation with the copilot |
-
----
-
-## 3. Configure `.env`
-
-The script reads API keys via `dotenv-kotlin`. Create `.env` in the `.assistant/` folder:
+### Download the script
 
 ```bash
-# Kodik Router (primary LLM provider — OpenRouter-compatible API)
-ORKEY=your-kodik-router-api-key
+mkdir -p ~/my-projects/my-some-great-project/assistant
+cd ~/my-projects/my-some-great-project/assistant
 
-# Dashscope / Alibaba Cloud (alternative cheap provider)
-DSKEY=your-dashscope-api-key
+curl -LO https://raw.githubusercontent.com/fiddlededee/my-copilot/refs/heads/main/copilot-v2.main.kts
 ```
 
-> **Note:** `ORKEY` is used regardless of which OpenRouter-compatible provider you configure in the script (Kodik Router, Selectel, OpenRouter, etc.). The script currently defaults to Kodik Router (`api.kodikrouter.ru`).
+### Create the `.env` file
 
----
+```bash
+cat > .env << 'EOF'
+# Pick ONE provider and fill in the key:
 
-## 4. Create a minimal `prompt.md`
+# For Kodik Router / OpenRouter (OpenAI-compatible):
+ORKEY=your-api-key-here
 
-```markdown
+# For Alibaba Dashscope (alternative, cheaper):
+# DSKEY=your-dashscope-key-here
+EOF
+```
+
+### Create a dialogue file
+
+```bash
+cat > prompt.md << 'EOF'
 # Us
 
-Hello! Help me with my project at ~/my-projects/my-some-great-project.
+Hello! What can you help me with in this project?
+
+# Us
+EOF
 ```
 
-The copilot reads this file, appends its answer as `# As`, and leaves a trailing `# Us` marker so you can continue the conversation.
+> The dialogue uses `# Us` / `# As` markers to separate user and assistant turns.  
+> The copilot appends its response after `# As` and adds a new `# Us` at the end.
 
----
+## 3. Configure the Script (Tuning Section)
 
-## 5. Test from the command line
+Open `copilot-v2.main.kts` and scroll to the **`// ========== Tuning agent =============`** section at the bottom (~line 1428). Key settings:
+
+| Function | What it does | Default |
+|----------|-------------|---------|
+| `providerTuning()` | LLM provider for the main agent | Kodik Router (OpenRouter-compatible) |
+| `searchProviderTuning()` | Provider for the `searchInternet` tool | Kodik Router with web plugin |
+| `currentModel()` | Model name | `qwen/qwen3.7-plus` |
+| `currentTools()` | Enabled tools | All except `runScript` |
+| `directModificationPathList()` | Paths where files are modified directly (no `.proposal`) | Empty (all via proposals) |
+| `dockerVolumes()` | Host → container volume mapping for sandbox | `..` → `/workspace` |
+
+**To switch to Dashscope** (comment/uncomment as indicated by `Doc hint` comments):
+```kotlin
+// Uncomment this block:
+fun providerTuning() = ProviderTuning(clientClass = DashscopeLLMClient::class) {
+    it["enable_thinking"] = JsonPrimitive(true)
+}
+// And comment out the Kodik Router block below it.
+```
+
+## 4. Run from Terminal (test first)
 
 ```bash
-cd ~/my-projects/my-some-great-project/.assistant
+cd ~/my-projects/my-some-great-project/assistant
 kotlin copilot-v2.main.kts ./prompt.md
 ```
 
-First run will download all dependencies (Koog, Ktor, etc.) — this may take a minute. Subsequent runs are faster.
+The first run will download all dependencies (Koog, serialization, etc.) — this takes a minute. Subsequent runs are faster.
 
----
+## 5. IntelliJ IDEA — External Tool Setup
 
-## 6. Set up IntelliJ / OpenIDE External Tool + Hotkey
+1. **Open** `~/my-projects/my-some-great-project` in IntelliJ IDEA.
 
-This is the author's recommended workflow: **one hotkey → copilot runs on your dialogue file**.
+2. **Settings → Tools → External Tools** → click **+**:
 
-### 6a. Add External Tool
+   | Field | Value |
+   |-------|-------|
+   | **Name** | `Copilot` |
+   | **Program** | `kotlin` |
+   | **Arguments** | `$FileDir$/copilot-v2.main.kts $FilePath$` |
+   | **Working directory** | `$FileDir$` |
 
-1. Open **Settings** (`Ctrl+Alt+S`) → **Tools → External Tools**
-2. Click **+** and fill in:
+   > This assumes you right-click `prompt.md` in the `assistant/` folder to run it.  
+   > `$FileDir$` = the folder containing the file, `$FilePath$` = full path to `prompt.md`.
 
-| Field | Value |
-|-------|-------|
-| **Name** | `Run Copilot` |
-| **Program** | `kotlin` |
-| **Arguments** | `copilot-v2.main.kts $FilePath$` |
-| **Working directory** | `$FileDir$` |
+3. **Assign a hotkey**: Settings → Keymap → search "Copilot" → add e.g. `Ctrl+Shift+P`.
 
-> `$FilePath$` passes the full path of the currently open `prompt.md`; `$FileDir$` sets CWD to the `.assistant/` folder (which is exactly what the script expects).
+4. **Usage**: Open `prompt.md`, type your question after the last `# Us`, press the hotkey. The response appears in-place.
 
-### 6b. Assign a hotkey
-
-1. Still in **Settings** → **Keymap**
-2. Expand **External Tools** → find **Run Copilot**
-3. Right-click → **Add Keyboard Shortcut** → press e.g. `Ctrl+Shift+F1`
-
-### 6c. Use it
-
-1. Open `prompt.md` in the editor
-2. Write your question after the last `# Us` marker
-3. Press your hotkey
-4. Wait — the copilot appends its answer as `# As` right in the same file
-5. Write your next question and repeat
-
----
-
-## 7. Tuning the agent (optional)
-
-At the bottom of `copilot-v2.main.kts` you'll find the **Tuning section** (look for `// ========== Tuning agent =============`). Key knobs:
-
-- **`providerTuning()`** — switch LLM provider. Uncomment the Dashscope block for Alibaba Cloud, or keep Kodik Router (default).
-- **`currentModel()`** — change the model. Default is `qwen/qwen3.7-plus`.
-- **`currentTools()`** — enable/disable tools. Uncomment `MainAgentTools::runScript` to enable Docker sandbox execution.
-- **`directModificationPathList()`** — add paths that the copilot can modify *directly* (without creating `.proposal` files). By default all modifications go through the proposal workflow.
-
----
-
-## Directory structure summary
+## 6. How It Works (at a glance)
 
 ```
-~/my-projects/my-some-great-project/       ← project root (mounted as /workspace in Docker)
-├── src/...                                 ← your actual project files
-├── build.gradle.kts
-└── .assistant/                             ← copilot folder (CWD when running)
-    ├── copilot-v2.main.kts                 ← the script
-    ├── .env                                ← API keys
-    ├── Dockerfile                          ← sandbox (optional)
-    ├── prompt.md                           ← dialogue file
-    ├── prompt.md.current.md                ← auto-saved state (created at runtime)
-    └── monitoring-output/                  ← reasoning logs (created at runtime)
+prompt.md  →  copilot-v2.main.kts  →  LLM API  →  tool calls  →  prompt.md
+   (read)         (agent loop)        (Kodik/OR)    (files, etc)    (append)
 ```
+
+- The script reads the dialogue from `prompt.md`, sends it to the LLM, processes tool calls iteratively (up to 30 iterations), then appends the assistant's final answer back to the same file.
+- **File modifications** go through a *proposal* mechanism by default: changes are written to `<filename>.proposal` for your review. Add paths to `directModificationPathList()` to bypass this.
+- **PII redaction** is applied automatically before sending the prompt to the LLM (passports, cards, API keys, etc.).
+- **Session logs** are saved to `assistant/monitoring-output/`.
+
+## 7. Optional: Dockerfile for Sandbox
+
+If you enable `MainAgentTools::runScript` in `currentTools()`, create a `Dockerfile` in the `assistant/` folder:
+
+```dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y python3 python3-pip nodejs npm && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
+```
+
+The sandbox mounts the parent directory (`~/my-projects/my-some-great-project/`) as `/workspace` inside the container.
 
 # Us

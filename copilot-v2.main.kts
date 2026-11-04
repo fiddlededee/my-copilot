@@ -2,7 +2,7 @@
 // Doc hint: the best way is to use with some IDE and a hotkey
 // Doc hint: my approach for Open-IDE, IntelliJ -- with external tools
 // Doc hint: my approach for VS Code -- with VS Code tasks
-// Doc hint: I usually place the copilot, Dockerfile and `.env` and diologue files into project assistant folder
+// Doc hint: I usually place the copilot, Dockerfile and `.env` and dialogue files into project assistant folder
 // Doc hint: standard LLM Providers are just for example, you may use any provider supported by Koog
 @file:CompilerOptions("-jvm-target", "17")
 @file:DependsOn("ru.fiddlededee.mycopilot:my-copilot-models:1.2.0")
@@ -19,6 +19,8 @@
 @file:DependsOn("org.angryscan:core-jvm:1.5.1")
 @file:DependsOn("io.github.cdimascio:dotenv-kotlin:6.4.1")
 @file:DependsOn("org.angryscan:core-jvm:1.5.1")
+@file:DependsOn("ai.koog:agents-mcp-jvm:1.3.0-beta")
+
 @file:OptIn(kotlin.time.ExperimentalTime::class)
 
 import ai.koog.agents.core.agent.AIAgent
@@ -82,6 +84,9 @@ import ai.koog.agents.features.eventHandler.feature.EventHandler
 import ai.koog.prompt.executor.clients.openrouter.OpenRouterModels
 import ai.koog.prompt.llm.LLMCapability
 import kotlinx.io.files.Path as KPath
+import ai.koog.agents.mcp.McpToolRegistryProvider
+import ai.koog.agents.mcp.metadata.McpServerInfo
+
 
 import ru.fiddlededee.mycopilot.models.ModificationType
 import ru.fiddlededee.mycopilot.models.Modification
@@ -90,8 +95,7 @@ import ru.fiddlededee.mycopilot.models.generateSchema
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-// Release hint: 1.2.0 no need for kotlinx serialization plugin
-val version="v1.2.0"
+val version="v1.2.1"
 
 data class ProviderTuning(
     val clientClass: KClass<out AbstractOpenAILLMClient<*, *>>,
@@ -654,7 +658,6 @@ class MainAgentTools : ToolSet {
         if (!dir.exists()) return "ERROR: Directory doesn't exist"
         if (!dir.isDirectory) return "ERROR: It is a file, not a directory"
 
-        // ── Phase 1: BFS to find how many levels fit within the threshold ──
         var currentLevelDirs = listOf(dir)
         var totalEntries = 0
         var maxDepth = 0
@@ -682,7 +685,6 @@ class MainAgentTools : ToolSet {
             maxDepth++
         }
 
-        // ── Phase 2: DFS to render the tree up to maxDepth ──
         val sb = StringBuilder()
         sb.appendLine(dir.absolutePath)
 
@@ -881,7 +883,7 @@ class ProposalSubAgent {
                 ModificationType.DELETE -> {
                     val startLine = mod.startLine ?: continue
                     val endLine = mod.endLine ?: startLine
-                    val si = startLine - 1;
+                    val si = startLine - 1
                     val ei = endLine - 1
                     if (si >= 0 && ei < lines.size && si <= ei)
                         lines.subList(si, ei + 1).clear()
@@ -890,7 +892,7 @@ class ProposalSubAgent {
                 ModificationType.REPLACE -> {
                     val startLine = mod.startLine ?: continue
                     val endLine = mod.endLine ?: startLine
-                    val si = startLine - 1;
+                    val si = startLine - 1
                     val ei = endLine - 1
                     val newLines = mod.contents?.lines() ?: emptyList()
                     if (si >= 0 && ei < lines.size && si <= ei) {
@@ -1369,10 +1371,14 @@ fun mainAgent() = AIAgent(
 
         maxAgentIterations = 5
     ),
-    toolRegistry = ToolRegistry {
-        tools(
-            MainAgentTools().asTools()
-                .filter { tool -> currentTools().any { currentTool -> currentTool.name == tool.name } })
+    toolRegistry = run {
+        val mcpRegistry = mcpTools()
+        ToolRegistry {
+            tools(
+                MainAgentTools().asTools()
+                    .filter { tool -> currentTools().any { currentTool -> currentTool.name == tool.name } })
+            tools(mcpRegistry.tools)
+        }
     },
     installFeatures = {
         install(EventHandler) {
@@ -1472,6 +1478,14 @@ fun showFileWhileReadingDirectoryIf(file: File): Boolean =
 fun dockerVolumes() = mapOf(File("..").canonicalFile to "/workspace")
 fun startReadLimit() = 40000
 fun scriptOutputLimit() = 100000
+
+// Doc hint: the example contents, in this case used to build documentation for this copilot
+fun predefinedCommand() = """
+    kotlin -version
+    curl https://raw.githubusercontent.com/fiddlededee/my-copilot/refs/heads/main/copilot-v2.main.kts
+    echo "ru.fiddlededee.mycopilot:my-copilot-models -> $(curl -s 'https://repo1.maven.org/maven2/ru/fiddlededee/mycopilot/my-copilot-models/maven-metadata.xml' | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' | paste -sd, - | sed 's/^$/None/')"
+    """.trimIndent()
+
 fun directModificationPathList() = listOf<String>(
 )
 
@@ -1483,7 +1497,7 @@ fun currentModel() =
 fun searchModel() = currentModel()
 fun basePath() = File("..").absolutePath
 
-// Doc hint: good idea to uncomment necessary tools for even each step in a diologue
+// Doc hint: good idea to uncomment necessary tools for even each step in a dialogue
 fun currentTools() = setOf<KFunction<String>>(
     MainAgentTools::readFile,
     MainAgentTools::readDirectory,
@@ -1495,9 +1509,11 @@ fun currentTools() = setOf<KFunction<String>>(
 //    MainAgentTools::runScript
 )
 
-// Doc hint: the example contents, in this case used to build documentation for this copilot
-fun predefinedCommand() = """
-    kotlin -version
-    curl https://raw.githubusercontent.com/fiddlededee/my-copilot/refs/heads/main/copilot-v2.main.kts
-    echo "ru.fiddlededee.mycopilot:my-copilot-models -> $(curl -s 'https://repo1.maven.org/maven2/ru/fiddlededee/mycopilot/my-copilot-models/maven-metadata.xml' | grep -o '<version>[^<]*</version>' | sed 's/<[^>]*>//g' | paste -sd, - | sed 's/^$/None/')"
-    """.trimIndent()
+// Doc hint: example of providing IntelliJ MCP server tools to the copilot, commented by default
+fun mcpTools(): ToolRegistry = runBlocking {
+    ToolRegistry {}
+//    McpToolRegistryProvider.fromTransport(
+//        transport = McpToolRegistryProvider.defaultSseTransport("http://127.0.0.1:64342/sse"),
+//        serverInfo = McpServerInfo()
+//    )
+}
